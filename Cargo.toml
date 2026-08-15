@@ -1,0 +1,67 @@
+[package]
+name = "rbx-switch"
+# Starts at 0.1.0 rather than continuing rbx-cli's 0.11.0. Nothing was ever
+# released from that number line carrying this tool, so inheriting it would
+# claim a history of releases that does not exist.
+version = "0.1.0"
+edition = "2021"
+# Set by a dependency, not by our code: our own sources need 1.82, and the
+# number below is the highest `rust-version` in the resolved graph (clap 4.6
+# and hashbrown 0.17 both declare 1.85). Lower than rbx-cli's 1.88, which was
+# `image` via `rbx-core` — neither of which comes along. It moves when a
+# dependency moves it; the `msrv` CI job is what stops it moving silently.
+rust-version = "1.85"
+license = "MPL-2.0"
+description = "Switch between signed-in Roblox Studio accounts from the command line"
+repository = "https://github.com/rbx-forge/rbx-switch"
+homepage = "https://github.com/rbx-forge/rbx-switch"
+authors = ["rbx-forge"]
+keywords = ["roblox", "studio", "cli", "accounts", "windows"]
+categories = ["command-line-utilities", "game-development"]
+readme = "README.md"
+
+[lib]
+name = "rbx_switch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rbx-switch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+colored = "2"
+dialoguer = "0.11"
+dirs = "6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Security_Credentials",
+    "Win32_Foundation",
+] }
+winreg = "0.55"
+
+# Release profile tuned for a distributed CLI binary. Slower to compile, but
+# the binary is smaller and starts faster.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# Default-on lints stay at their default level. Restriction-group lints like
+# `unwrap_used` are deliberately not enabled: too much noise on patterns that
+# are correct by construction.
+todo = "warn"
+dbg_macro = "warn"
+print_stdout = "allow"   # CLI tool, println! is intentional
+print_stderr = "allow"

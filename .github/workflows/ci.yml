@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel in-flight runs for the same ref when a new push arrives.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Windows only, on purpose. This tool reads the Studio account list out of the
+# Windows registry and writes the active user id into Windows Credential
+# Manager; on Linux `get_store()` returns an error and the platform modules do
+# not even compile in. A Linux job would therefore test the argument parser and
+# nothing else, and would report green on the day the Win32 calls broke. The
+# macOS module is a stub that returns "not yet tested" from every method, so a
+# macOS runner - billed at 10x - would buy no signal either.
+jobs:
+  test:
+    # `cargo test` compiles and links every target, so it doubles as the build
+    # check; a separate build job would link the same binary twice.
+    name: Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - run: cargo test --all-targets --verbose
+
+  fmt:
+    name: Rustfmt
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    # rust-version in Cargo.toml is a promise to whoever builds from source.
+    # Nothing enforces it on the stable toolchain above, so it is checked here
+    # against the exact version it names - and it moves the day a dependency
+    # moves it, deliberately rather than silently.
+    name: MSRV (1.85)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - run: cargo check --all-targets

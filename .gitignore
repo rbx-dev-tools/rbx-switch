@@ -1,0 +1,11 @@
+/target
+
+# Editor/tool configs
+.idea/
+.vscode/
+.zed/
+.claude/
+
+# A real `~/.rbxswitch.toml` holds user ids. A copy dropped in the repo for
+# testing is personal data one `git commit -a` away from being published.
+.rbxswitch.toml
