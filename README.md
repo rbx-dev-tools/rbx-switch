@@ -8,7 +8,11 @@ It used to be `rbx switch`, a subcommand of [`rbx-forge/rbx-cli`](https://github
 
 ## Install
 
-Prebuilt Windows binary from the [releases page](https://github.com/rbx-forge/rbx-switch/releases), or from source:
+```bash
+rokit add rbx-forge/rbx-switch
+```
+
+Or take the Windows binary from the [releases page](https://github.com/rbx-forge/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
 
 ```bash
 cargo install --git https://github.com/rbx-forge/rbx-switch
@@ -45,7 +49,7 @@ Switched to MainAccount (1122334455)
 
 ## Aliases
 
-Create `~/.rbxswitch.toml` to define short aliases:
+An alias is a short name for an account:
 
 ```toml
 [aliases]
@@ -53,10 +57,33 @@ dev = 9876543210
 main = 1122334455
 ```
 
-Then use them directly:
-
 ```bash
 rbx-switch dev
+```
+
+Aliases come from two files, and the project one wins:
+
+| File | Scope | Commit it? |
+|------|-------|------------|
+| `rbxswitch.toml` | This project. Looked for in the working directory and upwards, so it works from a subdirectory. | Yes |
+| `~/.rbxswitch.toml` | You, everywhere. | It is in your home directory |
+
+They merge key by key, so a personal `main` survives alongside a project's `dev`. Neither file has to exist: aliases are a convenience over usernames and user ids, which always work.
+
+The project file is worth committing. It holds nothing but names pointing at **public** Roblox user ids, no secret of any kind, and its whole value is that everyone on the repository means the same account by `dev`.
+
+The names differ by one character on purpose. Every project file in the [rbx-cli](https://github.com/rbx-forge/rbx-cli) family is undotted (`rbxplace.toml`, `rbxshop.toml`, and the rest) because those files are read and reviewed, while a home directory follows the opposite convention (`.gitconfig`, `.npmrc`). It also means a stray file in the wrong place is simply not read.
+
+### One account for the whole machine
+
+Studio has a single signed-in account, so a switch outlives the directory you made it in. If `dev` means different accounts in two checkouts, switching in one and then working in the other leaves you signed in as somebody that checkout never named, and the failure usually surfaces later as a permission error on a resource rather than as "wrong account".
+
+Because of that, a switch made through an alias says which file chose it:
+
+```
+$ rbx-switch dev
+Switched to DevAccount (9876543210)
+  alias from this project - Studio stays on this account until you switch again
 ```
 
 An alias pointing at an account that is no longer signed in is skipped rather than resolved, so the name falls through to the username lookup instead of failing on a dead id.
@@ -67,17 +94,17 @@ Roblox Studio stores signed-in accounts and the active user ID in platform-speci
 
 - **Windows**: Accounts are listed in the Windows Registry (`LoggedInUsersStore`), and the active user ID is stored in Windows Credential Manager (`RobloxStudioAuthuserid`). Tools like [rbx_cookie](https://github.com/blake-mealey/mantle/tree/main/rbx_cookie) read this credential to determine which `.ROBLOSECURITY` cookie to use.
 
-- **macOS**: Not yet implemented - contributions welcome!
+- **macOS**: The storage locations are known (`defaults` for the account list, the app's binary cookie store for the active user id) but the implementation is a stub that returns "not yet tested" from every method. Finishing it needs a Mac with Studio installed to verify both locations against a real install. Contributions welcome.
 
 ## Platform support
 
 | Platform | Status |
 |----------|--------|
-| Windows | Supported |
-| macOS | Stub (not yet tested) |
-| Linux | Not yet supported (Studio runs via [Vinegar](https://vinegarhq.org/)) |
+| Windows | Supported and tested in CI |
+| macOS | Stub. The code paths exist and are unverified. |
+| Linux | Roblox does not ship Studio for Linux, so there is no account list to read. |
 
-CI runs on Windows only, for the same reason: it is the one platform where the credential store this tool talks to actually exists.
+CI runs on Windows only. It is the one platform where the credential store this tool talks to exists, so a job anywhere else would exercise the argument parser and report green on the day the real calls broke. A macOS runner, billed at ten times the rate, would test a stub.
 
 ## License
 

@@ -15,7 +15,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 
-use crate::config::Config;
+use crate::config::{Config, Source};
 use crate::credential::{Account, CredentialStore};
 
 /// Cross-cutting flags, kept in one `Args` group so they can be placed either
@@ -79,7 +79,7 @@ pub fn run(cli: SwitchCli, global: &GlobalFlags) -> Result<()> {
     let config = Config::load()?;
 
     match cli.command {
-        Some(SwitchCommands::List) => cmd_list(&*store),
+        Some(SwitchCommands::List) => cmd_list(&*store, &config),
         Some(SwitchCommands::Current) => cmd_current(&*store),
         Some(SwitchCommands::Use { name }) => cmd_switch(&*store, &config, &name),
         None => {
@@ -116,7 +116,7 @@ fn get_store() -> Result<Box<dyn CredentialStore>> {
     }
 }
 
-fn cmd_list(store: &dyn CredentialStore) -> Result<()> {
+fn cmd_list(store: &dyn CredentialStore, config: &Config) -> Result<()> {
     let accounts = store.list_accounts()?;
     let current = store.current_user_id()?;
 
@@ -140,6 +140,23 @@ fn cmd_list(store: &dyn CredentialStore) -> Result<()> {
             account.username.cyan(),
             account.user_id.dimmed(),
         );
+    }
+
+    // Naming the files that are in effect answers "why does `dev` mean that
+    // here" without making the reader guess which of the two won, and it is
+    // the only place a project file the reader did not know about shows up.
+    let sources = [
+        config.project_path().map(|p| ("project", p)),
+        config.global_path().map(|p| ("personal", p)),
+    ];
+    if sources.iter().any(Option::is_some) {
+        println!();
+        for (label, path) in sources.into_iter().flatten() {
+            println!(
+                "  {}",
+                format!("{label} aliases: {}", path.display()).dimmed()
+            );
+        }
     }
 
     Ok(())
@@ -166,20 +183,33 @@ fn cmd_current(store: &dyn CredentialStore) -> Result<()> {
 
 fn cmd_switch(store: &dyn CredentialStore, config: &Config, name: &str) -> Result<()> {
     let accounts = store.list_accounts()?;
-    let user_id = resolve_account(&accounts, config, name)?;
+    let resolved = resolve_account(&accounts, config, name)?;
 
     let account = accounts
         .iter()
-        .find(|a| a.user_id == user_id)
+        .find(|a| a.user_id == resolved.user_id)
         .ok_or_else(|| anyhow!("Account not found: {name}"))?;
 
-    store.set_user_id(&user_id)?;
+    store.set_user_id(&resolved.user_id)?;
     println!(
         "{} {} ({})",
         "Switched to".green(),
         account.username.cyan(),
         account.user_id.dimmed(),
     );
+
+    // Which file named this account, and the reminder that the switch outlives
+    // the directory it was made in. Studio has one signed-in account for the
+    // whole machine, so a project-local alias can leave the next checkout
+    // signed in as somebody it never mentions.
+    if let Some(source) = resolved.via {
+        println!(
+            "  {} {} {}",
+            "alias from".dimmed(),
+            source.describe().dimmed(),
+            "- Studio stays on this account until you switch again".dimmed(),
+        );
+    }
 
     Ok(())
 }
@@ -240,23 +270,43 @@ fn cmd_interactive(store: &dyn CredentialStore, global: &GlobalFlags) -> Result<
     Ok(())
 }
 
-fn resolve_account(accounts: &[Account], config: &Config, name: &str) -> Result<String> {
+/// How a name was turned into a user id, so the caller can say it out loud.
+///
+/// Only the alias case carries anything: a user id or a username is its own
+/// explanation, while an alias is a project-local name for machine-global
+/// state and the reader deserves to know which file chose it.
+#[derive(Debug)]
+struct Resolved {
+    user_id: String,
+    via: Option<Source>,
+}
+
+fn resolve_account(accounts: &[Account], config: &Config, name: &str) -> Result<Resolved> {
     // 1. Direct user ID
     if accounts.iter().any(|a| a.user_id == name) {
-        return Ok(name.to_string());
+        return Ok(Resolved {
+            user_id: name.to_string(),
+            via: None,
+        });
     }
 
     // 2. Alias from config
-    if let Some(id) = config.resolve_alias(name) {
+    if let Some((id, source)) = config.resolve_alias(name) {
         if accounts.iter().any(|a| a.user_id == id) {
-            return Ok(id);
+            return Ok(Resolved {
+                user_id: id,
+                via: Some(source),
+            });
         }
     }
 
     // 3. Username (case-insensitive)
     let lower = name.to_lowercase();
     if let Some(account) = accounts.iter().find(|a| a.username.to_lowercase() == lower) {
-        return Ok(account.user_id.clone());
+        return Ok(Resolved {
+            user_id: account.user_id.clone(),
+            via: None,
+        });
     }
 
     Err(anyhow!(
@@ -287,7 +337,9 @@ mod tests {
     fn a_user_id_resolves_to_itself() {
         let config = Config::default();
         assert_eq!(
-            resolve_account(&accounts(), &config, "9876543210").unwrap(),
+            resolve_account(&accounts(), &config, "9876543210")
+                .unwrap()
+                .user_id,
             "9876543210"
         );
     }
@@ -296,18 +348,22 @@ mod tests {
     fn a_username_resolves_regardless_of_case() {
         let config = Config::default();
         assert_eq!(
-            resolve_account(&accounts(), &config, "mainaccount").unwrap(),
+            resolve_account(&accounts(), &config, "mainaccount")
+                .unwrap()
+                .user_id,
             "1122334455"
         );
     }
 
     #[test]
     fn an_alias_resolves_through_the_config() {
-        let mut config = Config::default();
-        config.aliases.insert("dev".to_string(), 9_876_543_210);
+        let config = Config::with_alias("dev", 9_876_543_210, Source::Project);
+        let resolved = resolve_account(&accounts(), &config, "dev").unwrap();
+        assert_eq!(resolved.user_id, "9876543210");
         assert_eq!(
-            resolve_account(&accounts(), &config, "dev").unwrap(),
-            "9876543210"
+            resolved.via,
+            Some(Source::Project),
+            "the switch line has to be able to say which file named this account"
         );
     }
 
@@ -317,8 +373,7 @@ mod tests {
     /// exist.
     #[test]
     fn an_alias_for_a_signed_out_account_falls_through() {
-        let mut config = Config::default();
-        config.aliases.insert("gone".to_string(), 1);
+        let config = Config::with_alias("gone", 1, Source::Global);
         let error = resolve_account(&accounts(), &config, "gone").unwrap_err();
         assert!(
             error.to_string().contains("No account found matching"),

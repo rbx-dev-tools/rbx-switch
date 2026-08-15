@@ -65,3 +65,6 @@ todo = "warn"
 dbg_macro = "warn"
 print_stdout = "allow"   # CLI tool, println! is intentional
 print_stderr = "allow"
+
+[dev-dependencies]
+tempfile = "3"
