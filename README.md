@@ -63,14 +63,14 @@ rbx-switch dev
 
 Aliases come from two files, and the project one wins:
 
-| File | Scope | Commit it? |
-|------|-------|------------|
-| `rbxswitch.toml` | This project. Looked for in the working directory and upwards, so it works from a subdirectory. | Yes |
-| `~/.rbxswitch.toml` | You, everywhere. | It is in your home directory |
+| File | Scope |
+|------|-------|
+| `rbxswitch.toml` | This project. Looked for in the working directory and upwards, so it works from a subdirectory. |
+| `~/.rbxswitch.toml` | You, everywhere. |
 
 They merge key by key, so a personal `main` survives alongside a project's `dev`. Neither file has to exist: aliases are a convenience over usernames and user ids, which always work.
 
-The project file is worth committing. It holds nothing but names pointing at **public** Roblox user ids, no secret of any kind, and its whole value is that everyone on the repository means the same account by `dev`.
+**Commit the project file.** It holds nothing but names pointing at public Roblox user ids, the kind of number anyone can read off a profile, so there is no secret in it. And sharing it is the entire point: an alias only helps if everyone on the repository means the same account by `dev`. Gitignore it and each person rebuilds their own, which puts you back where you started.
 
 The names differ by one character on purpose. Every project file in the [rbx-cli](https://github.com/rbx-forge/rbx-cli) family is undotted (`rbxplace.toml`, `rbxshop.toml`, and the rest) because those files are read and reviewed, while a home directory follows the opposite convention (`.gitconfig`, `.npmrc`). It also means a stray file in the wrong place is simply not read.
 
