@@ -4,7 +4,7 @@ Switch between Roblox Studio accounts from the command line.
 
 `rbx-switch` reads the accounts signed into Roblox Studio and lets you switch between them without opening Studio. This is useful for headless workflows (e.g. switching before running [Lune](https://github.com/lune-org/lune) scripts that use `getAuthCookie`).
 
-It used to be `rbx switch`, a subcommand of [`rbx-forge/rbx-cli`](https://github.com/rbx-forge/rbx-cli). It moved here because it shares no domain with that tool: `rbx` reconciles a repository with Roblox over Open Cloud, while this manipulates locally signed-in Studio accounts on one desktop. Nothing was ever released carrying `rbx switch`, so there is no old invocation to keep working.
+If you saw this as `rbx switch`: it was a subcommand of `rbx-forge/rbx-cli` and now lives here, as `rbx-switch`. Nothing was ever released carrying the old spelling, so there is no version of it still working anywhere.
 
 ## Install
 
@@ -52,37 +52,42 @@ Switched to MainAccount (1122334455)
 An alias is a short name for an account:
 
 ```toml
+# rbxswitch.toml, committed with the project
 [aliases]
-dev = 9876543210
-main = 1122334455
+qa = 9876543210
+assets = 1122334455
 ```
 
 ```bash
-rbx-switch dev
+rbx-switch qa
 ```
 
 Aliases come from two files, and the project one wins:
 
-| File | Scope |
-|------|-------|
-| `rbxswitch.toml` | This project. Looked for in the working directory and upwards, so it works from a subdirectory. |
-| `~/.rbxswitch.toml` | You, everywhere. |
+| File | For |
+|------|-----|
+| `rbxswitch.toml` | Accounts the **project** owns: the account behind the group, an assets account, a QA account. Looked for in the working directory and upwards, so it works from a subdirectory. |
+| `~/.rbxswitch.toml` | Accounts **you** own. |
 
-They merge key by key, so a personal `main` survives alongside a project's `dev`. Neither file has to exist: aliases are a convenience over usernames and user ids, which always work.
+They merge key by key, so your personal `main` survives alongside the project's `qa`. Neither file has to exist: aliases are a convenience over usernames and user ids, which always work.
 
-**Commit the project file.** It holds nothing but names pointing at public Roblox user ids, the kind of number anyone can read off a profile, so there is no secret in it. And sharing it is the entire point: an alias only helps if everyone on the repository means the same account by `dev`. Gitignore it and each person rebuilds their own, which puts you back where you started.
+The split is about whose account it is, not about precedence. A shared purpose-built account means the same thing to everyone on the repository, so naming it once in a committed file saves every teammate from rediscovering the id. Your own account means nothing to them: put it in your personal file, where it follows you across projects instead of sitting in someone else's checkout.
 
-The names differ by one character on purpose. Every project file in the [rbx-cli](https://github.com/rbx-forge/rbx-cli) family is undotted (`rbxplace.toml`, `rbxshop.toml`, and the rest) because those files are read and reviewed, while a home directory follows the opposite convention (`.gitconfig`, `.npmrc`). It also means a stray file in the wrong place is simply not read.
+Committing the project file is safe in itself, whatever you put in it. It holds names pointing at public Roblox user ids, the kind of number anyone can read off a profile, and never a credential of any kind.
+
+When both files name the same alias, the project wins, the way a repository's `git config` beats your global one. That works because the two files are meant to hold different accounts: if you find yourself wanting to override a project alias with your own account, that alias was a personal one written in the wrong file.
+
+The leading dot on the personal file is the only difference between the two names. It follows what each location expects: a committed file stays visible because people read and review it, a home-directory file hides because nobody wants it in every listing. It also means a copy left in the wrong place is simply not read.
 
 ### One account for the whole machine
 
-Studio has a single signed-in account, so a switch outlives the directory you made it in. If `dev` means different accounts in two checkouts, switching in one and then working in the other leaves you signed in as somebody that checkout never named, and the failure usually surfaces later as a permission error on a resource rather than as "wrong account".
+Studio has a single signed-in account, so a switch outlives the directory you made it in. If `qa` means different accounts in two checkouts, switching in one and then working in the other leaves you signed in as somebody that checkout never named, and the failure usually surfaces later as a permission error on a resource rather than as "wrong account".
 
 Because of that, a switch made through an alias says which file chose it:
 
 ```
-$ rbx-switch dev
-Switched to DevAccount (9876543210)
+$ rbx-switch qa
+Switched to QaAccount (9876543210)
   alias from this project - Studio stays on this account until you switch again
 ```
 
