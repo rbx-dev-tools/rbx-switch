@@ -9,13 +9,13 @@ If you saw this as `rbx switch`: it was a subcommand of `rbx-forge/rbx-cli` and 
 ## Install
 
 ```bash
-rokit add rbx-forge/rbx-switch
+rokit add rbx-dev-tools/rbx-switch
 ```
 
-Or take the Windows binary from the [releases page](https://github.com/rbx-forge/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
+Or take the Windows binary from the [releases page](https://github.com/rbx-dev-tools/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
 
 ```bash
-cargo install --git https://github.com/rbx-forge/rbx-switch
+cargo install --git https://github.com/rbx-dev-tools/rbx-switch
 ```
 
 ## Usage
