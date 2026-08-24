@@ -28,12 +28,31 @@ rbx-switch <name>            # Shorthand for `rbx-switch use <name>`
 rbx-switch                   # Interactive account picker
 ```
 
-Two flags apply everywhere, before or after the subcommand:
+Three flags apply everywhere, before or after the subcommand:
 
 | Flag | Effect |
 |------|--------|
 | `--no-color` | Never colour the output. `NO_COLOR` in the environment does the same without the flag. |
 | `--non-interactive` | Fail instead of opening the picker, so a script with a missing account name errors out rather than hanging. |
+| `--json` | Print machine-readable JSON from `list` and `current`, instead of the human listing. Implies `--no-color`. |
+
+### For a script
+
+The human listing is a layout, and a layout is free to change. `--json` is the
+shape a script may depend on:
+
+```bash
+$ rbx-switch list --json
+{"accounts":[{"user_id":"1234567890","username":"MainAccount","active":true}]}
+
+$ rbx-switch current --json
+{"account":{"user_id":"1234567890","username":"MainAccount"}}
+```
+
+One document rather than a line per account: the list is small, fixed and read
+whole, so there is nothing to stream and a caller parses it in one go.
+`current` answers `{"account":null}` when Studio has no active account, which a
+caller has to handle either way.
 
 ### Example
 

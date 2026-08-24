@@ -44,6 +44,14 @@ pub struct GlobalFlags {
     /// a missing name is an error you can see rather than a hung job.
     #[arg(long, global = true)]
     pub non_interactive: bool,
+
+    /// Print machine-readable JSON instead of the human listing.
+    ///
+    /// For `list` and `current`. The human output is a layout, and a layout is
+    /// free to change; this is the shape a script may depend on. Colour is
+    /// suppressed with it, since a caller parsing JSON never wants escapes.
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -71,7 +79,7 @@ pub enum SwitchCommands {
 }
 
 pub fn run(cli: SwitchCli, global: &GlobalFlags) -> Result<()> {
-    if global.no_color {
+    if global.no_color || global.json {
         colored::control::set_override(false);
     }
 
@@ -79,6 +87,8 @@ pub fn run(cli: SwitchCli, global: &GlobalFlags) -> Result<()> {
     let config = Config::load()?;
 
     match cli.command {
+        Some(SwitchCommands::List) if global.json => json_list(&*store),
+        Some(SwitchCommands::Current) if global.json => json_current(&*store),
         Some(SwitchCommands::List) => cmd_list(&*store, &config),
         Some(SwitchCommands::Current) => cmd_current(&*store),
         Some(SwitchCommands::Use { name }) => cmd_switch(&*store, &config, &name),
@@ -114,6 +124,48 @@ fn get_store() -> Result<Box<dyn CredentialStore>> {
              macOS keychain, and neither exists here."
         )
     }
+}
+
+/// `list` as one JSON document.
+///
+/// A document rather than a line-per-account stream: the account list is
+/// small, fixed and read whole, so there is nothing to stream and a caller
+/// gets to parse it in one call.
+fn json_list(store: &dyn CredentialStore) -> Result<()> {
+    let accounts = store.list_accounts()?;
+    let current = store.current_user_id()?;
+
+    let rows: Vec<_> = accounts
+        .iter()
+        .map(|account| {
+            serde_json::json!({
+                "user_id": account.user_id,
+                "username": account.username,
+                "active": current.as_ref() == Some(&account.user_id),
+            })
+        })
+        .collect();
+
+    println!("{}", serde_json::json!({ "accounts": rows }));
+    Ok(())
+}
+
+/// `current` as one JSON document. `account` is `null` when Studio has no
+/// active account, which a caller has to handle either way.
+fn json_current(store: &dyn CredentialStore) -> Result<()> {
+    let accounts = store.list_accounts()?;
+    let current = store.current_user_id()?;
+
+    let account = current.map(|id| {
+        let username = accounts
+            .iter()
+            .find(|a| a.user_id == id)
+            .map(|a| a.username.clone());
+        serde_json::json!({ "user_id": id, "username": username })
+    });
+
+    println!("{}", serde_json::json!({ "account": account }));
+    Ok(())
 }
 
 fn cmd_list(store: &dyn CredentialStore, config: &Config) -> Result<()> {
