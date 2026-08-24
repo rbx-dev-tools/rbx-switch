@@ -3,7 +3,7 @@ name = "rbx-switch"
 # Starts at 0.1.0 rather than continuing rbx-cli's 0.11.0. Nothing was ever
 # released from that number line carrying this tool, so inheriting it would
 # claim a history of releases that does not exist.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Set by a dependency, not by our code: our own sources need 1.82, and the
 # number below is the highest `rust-version` in the resolved graph (clap 4.6
