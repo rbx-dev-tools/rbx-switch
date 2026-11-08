@@ -17,12 +17,19 @@ rbx-account                   # pick from a list
 
 ## Install
 
-With [mise](https://mise.jdx.dev) or [Rokit](https://github.com/rojo-rbx/rokit), either of which pins the latest release in your project's config:
+With [mise](https://mise.jdx.dev):
 
 ```bash
 mise use --pin github:rbx-forge/rbx-account
-rokit add rbx-forge/rbx-account   # or, with Rokit
 ```
+
+Or with [Rokit](https://github.com/rojo-rbx/rokit):
+
+```bash
+rokit add rbx-forge/rbx-account
+```
+
+Either one pins the latest release in your project's config.
 
 Or take the Windows binary from the [releases page](https://github.com/rbx-forge/rbx-account/releases), which ships a zip and a `SHA256SUMS`, or build from source:
 
