@@ -6,14 +6,23 @@
 use anyhow::{anyhow, Context, Result};
 use std::slice;
 
-use windows_sys::Win32::Foundation::TRUE;
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, TRUE};
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::credential::{Account, CredentialStore};
+use crate::player::Session;
 
 const USERID_TARGET: &str = "https://www.roblox.com:RobloxStudioAuthuserid";
+/// Followed by the user id. Holds the raw `.ROBLOSECURITY` value.
+const SESSION_TARGET_PREFIX: &str = "https://www.roblox.com:RobloxStudioAuth.ROBLOSECURITY";
 const REGISTRY_PATH: &str =
     r"SOFTWARE\Roblox\RobloxStudio\LoggedInUsersStore\https:\www.roblox.com";
 
@@ -147,6 +156,97 @@ impl CredentialStore for WindowsCredentialStore {
 
     fn set_user_id(&self, user_id: &str) -> Result<()> {
         Self::write_credential(USERID_TARGET, user_id)
+    }
+
+    fn session(&self, user_id: &str) -> Result<Option<Session>> {
+        // A missing credential is the normal "listed but never stored" case,
+        // so it is `None`; a present one of the wrong shape is an error, since
+        // it means Studio changed its storage and the user cannot fix that.
+        let Ok(raw) = Self::read_credential(&format!("{SESSION_TARGET_PREFIX}{user_id}")) else {
+            return Ok(None);
+        };
+        Session::parse(&raw).map(Some).ok_or_else(|| {
+            anyhow!(
+                "The Studio session stored for {user_id} is not in the expected format. \
+                 Studio may have changed how it stores sessions."
+            )
+        })
+    }
+
+    fn ensure_player_installed(&self) -> Result<()> {
+        winreg::RegKey::predef(winreg::enums::HKEY_CLASSES_ROOT)
+            .open_subkey("roblox-player")
+            .map(|_| ())
+            .map_err(|_| {
+                anyhow!("The Roblox Player is not installed: nothing handles roblox-player: links.")
+            })
+    }
+
+    fn player_running(&self) -> Result<bool> {
+        const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
+
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(anyhow!(
+                    "Could not list running processes: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+            let mut found = false;
+            let mut more = Process32FirstW(snapshot, &mut entry) == TRUE;
+            while more {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if name.eq_ignore_ascii_case(PLAYER_EXE) {
+                    found = true;
+                    break;
+                }
+                more = Process32NextW(snapshot, &mut entry) == TRUE;
+            }
+
+            CloseHandle(snapshot);
+            Ok(found)
+        }
+    }
+
+    fn open_player(&self, uri: &str) -> Result<()> {
+        // ShellExecuteW, not `explorer "<uri>"`. explorer is what launches
+        // Studio elsewhere in this toolset, but measured on 2026-11-08 it
+        // hands the Player a ticket the Player then fails to redeem (HTTP 403
+        // on authentication-ticket/redeem, "authentication error" dialog),
+        // while the very same ticket opened with ShellExecute signs in. The
+        // ticket is only letters, digits, `-` and `_`, so what explorer alters
+        // is not known; ShellExecute is what a browser and Start-Process use.
+        //
+        // The return value is greater than 32 on success, and an error code
+        // otherwise.
+        let file = to_wide(uri);
+        let verb = to_wide("open");
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if result <= 32 {
+            return Err(anyhow!(
+                "Windows could not open the Roblox Player (ShellExecute error {result})"
+            ));
+        }
+        Ok(())
     }
 }
 

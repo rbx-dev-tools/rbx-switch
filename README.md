@@ -8,6 +8,7 @@ rbx-account current           # the active account
 rbx-account use <name>        # by username, user id or alias
 rbx-account <name>            # the same
 rbx-account                   # pick from a list
+rbx-account <name> --player   # switch the Roblox Player instead
 ```
 
 ## Requirements
@@ -79,9 +80,31 @@ The two merge, and the project file wins on a shared name. An alias pointing at 
 
 **One account for the whole machine.** Studio has one signed-in account, so a switch made in one checkout applies everywhere. A switch through an alias says which file chose it, so a wrong account shows up here rather than later as a permission error.
 
+## The Roblox Player
+
+`--player` switches the Player rather than Studio, with the same accounts and aliases:
+
+```bash
+rbx-account qa --player              # the Player, signed in as qa
+rbx-account qa --studio --player     # both apps
+rbx-account --player                 # pick from a list
+```
+
+Any account signed in to Studio can be switched to: the Player has no account list of its own here.
+
+**It restarts the Player.** Switching starts a new Player on its home screen, signed in as the account, and the one already open exits a few seconds later, leaving any game in progress. So `--player` is refused while a Player is open; close it, or pass `--force` to switch anyway. The Player stays on the account afterwards.
+
+**Wait before joining a game.** `rbx-account qa --player && <something that joins a game>` races: the join reaches the old Player just before it is closed. Join once the new Player shows its home screen.
+
+`list` and `current` stay about Studio. The Player keeps no account this tool can read back, so `current --player` is refused rather than answered with Studio's account.
+
+Windows only.
+
 ## How it works
 
 On Windows, Studio lists signed-in accounts in the registry (`LoggedInUsersStore`) and keeps the active user id in Credential Manager (`RobloxStudioAuthuserid`). `rbx-account` rewrites the latter. On macOS the locations are known but unverified; contributions from someone with a Mac and Studio are welcome.
+
+For `--player`, it reads the account's Studio session from Credential Manager and sends it to `auth.roblox.com` to get a single-use sign-in ticket, the one the website gets when you press Play. It then opens a `roblox-player:` link carrying that ticket. The session goes to `auth.roblox.com` and nowhere else, and is never printed. This is the only network call the tool makes, and only `--player` makes it.
 
 ## License
 

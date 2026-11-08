@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::credential::{Account, CredentialStore};
+use crate::player::Session;
 
 pub struct MacCredentialStore;
 
@@ -41,5 +42,21 @@ impl CredentialStore for MacCredentialStore {
         Err(anyhow!(
             "macOS support is not yet tested. Contributions welcome!"
         ))
+    }
+
+    fn session(&self, _user_id: &str) -> Result<Option<Session>> {
+        Err(anyhow!("--player is Windows only for now."))
+    }
+
+    fn ensure_player_installed(&self) -> Result<()> {
+        Err(anyhow!("--player is Windows only for now."))
+    }
+
+    fn player_running(&self) -> Result<bool> {
+        Err(anyhow!("--player is Windows only for now."))
+    }
+
+    fn open_player(&self, _uri: &str) -> Result<()> {
+        Err(anyhow!("--player is Windows only for now."))
     }
 }
