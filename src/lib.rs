@@ -19,8 +19,8 @@ use crate::config::{Config, Source};
 use crate::credential::{Account, CredentialStore};
 
 /// Cross-cutting flags, kept in one `Args` group so they can be placed either
-/// before or after the subcommand: `rbx-switch --no-color list` and
-/// `rbx-switch list --no-color` both work.
+/// before or after the subcommand: `rbx-account --no-color list` and
+/// `rbx-account list --no-color` both work.
 ///
 /// An earlier version accepted seven more flags, about Open Cloud auth and
 /// place resolution, and never read any of them. The two below are the ones a
@@ -37,7 +37,7 @@ pub struct GlobalFlags {
 
     /// Fail instead of opening the interactive picker.
     ///
-    /// The picker is what `rbx-switch` does when given no account name, and it
+    /// The picker is what `rbx-account` does when given no account name, and it
     /// blocks forever on a machine with no terminal. In a script, pass this so
     /// a missing name is an error you can see rather than a hung job.
     #[arg(long, global = true)]
@@ -57,7 +57,7 @@ pub struct SwitchCli {
     #[command(subcommand)]
     pub command: Option<SwitchCommands>,
 
-    /// Switch directly by alias or username (shorthand for `rbx-switch use <name>`).
+    /// Switch directly by alias or username (shorthand for `rbx-account use <name>`).
     pub name: Option<String>,
 }
 
@@ -117,7 +117,7 @@ fn get_store() -> Result<Box<dyn CredentialStore>> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         anyhow::bail!(
-            "rbx-switch is not supported on this platform.\n\
+            "rbx-account is not supported on this platform.\n\
              Studio stores its signed-in accounts in the Windows registry or the \
              macOS keychain, and neither exists here."
         )
@@ -279,7 +279,7 @@ fn cmd_interactive(store: &dyn CredentialStore, global: &GlobalFlags) -> Result<
     if global.non_interactive {
         bail!(
             "No account named, and --non-interactive forbids the picker. \
-             Pass an alias, username or user id, or run `rbx-switch list` to see them."
+             Pass an alias, username or user id, or run `rbx-account list` to see them."
         );
     }
 
@@ -360,7 +360,7 @@ fn resolve_account(accounts: &[Account], config: &Config, name: &str) -> Result<
     }
 
     Err(anyhow!(
-        "No account found matching '{name}'. Use `rbx-switch list` to see available accounts."
+        "No account found matching '{name}'. Use `rbx-account list` to see available accounts."
     ))
 }
 
@@ -436,7 +436,7 @@ mod tests {
         let config = Config::default();
         let error = resolve_account(&accounts(), &config, "nobody").unwrap_err();
         assert!(
-            error.to_string().contains("rbx-switch list"),
+            error.to_string().contains("rbx-account list"),
             "unexpected error: {error}"
         );
     }

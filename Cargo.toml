@@ -1,6 +1,6 @@
 [package]
-name = "rbx-switch"
-version = "0.2.0"
+name = "rbx-account"
+version = "0.3.0"
 edition = "2021"
 # Set by a dependency, not by our code: our own sources need 1.82, and the
 # number below is the highest `rust-version` in the resolved graph (clap 4.6
@@ -9,19 +9,19 @@ edition = "2021"
 rust-version = "1.85"
 license = "MPL-2.0"
 description = "Switch between signed-in Roblox Studio accounts from the command line"
-repository = "https://github.com/rbx-forge/rbx-switch"
-homepage = "https://github.com/rbx-forge/rbx-switch"
+repository = "https://github.com/rbx-forge/rbx-account"
+homepage = "https://github.com/rbx-forge/rbx-account"
 authors = ["rbx-forge"]
 keywords = ["roblox", "studio", "cli", "accounts", "windows"]
 categories = ["command-line-utilities", "game-development"]
 readme = "README.md"
 
 [lib]
-name = "rbx_switch"
+name = "rbx_account"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rbx-switch"
+name = "rbx-account"
 path = "src/main.rs"
 
 [dependencies]

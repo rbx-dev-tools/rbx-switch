@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 /// Undotted, because a project file is committed, read and reviewed, and hiding
 /// it would work against that purpose. The personal file keeps the leading dot
 /// that a home directory expects.
-const PROJECT_FILE: &str = "rbxswitch.toml";
-const GLOBAL_FILE: &str = ".rbxswitch.toml";
+const PROJECT_FILE: &str = "rbxaccount.toml";
+const GLOBAL_FILE: &str = ".rbxaccount.toml";
 
-/// One `rbxswitch.toml` as written on disk.
+/// One `rbxaccount.toml` as written on disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AliasFile {
     #[serde(default)]

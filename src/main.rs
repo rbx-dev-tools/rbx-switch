@@ -1,4 +1,4 @@
-//! The `rbx-switch` binary.
+//! The `rbx-account` binary.
 //!
 //! The logic lives in the library half so the account-resolution rules stay
 //! unit-testable without a terminal; this file is the parser and the exit
@@ -9,11 +9,11 @@ use std::process::ExitCode;
 use clap::Parser;
 use colored::Colorize;
 
-use rbx_switch::{GlobalFlags, SwitchCli};
+use rbx_account::{GlobalFlags, SwitchCli};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rbx-switch",
+    name = "rbx-account",
     version,
     about = "Switch between signed-in Roblox Studio accounts",
     long_about = "Switch between the Roblox accounts signed into Studio, without opening \
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 
     // The error is printed here rather than returned from `main` so it reads
     // as a sentence to a user instead of a `Debug` dump of an `anyhow::Error`.
-    match rbx_switch::run(cli.switch, &cli.global) {
+    match rbx_account::run(cli.switch, &cli.global) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{} {error:#}", "error:".red().bold());
