@@ -18,10 +18,9 @@ use serde::{Deserialize, Serialize};
 
 /// The file name looked for in a project, and upwards from it.
 ///
-/// Undotted, matching every project file in the rbx-cli family
-/// (`rbxplace.toml`, `rbxshop.toml`, and the rest): they are committed, read
-/// and reviewed, so hiding them would work against their purpose. The personal
-/// file keeps the leading dot that a home directory expects.
+/// Undotted, because a project file is committed, read and reviewed, and hiding
+/// it would work against that purpose. The personal file keeps the leading dot
+/// that a home directory expects.
 const PROJECT_FILE: &str = "rbxswitch.toml";
 const GLOBAL_FILE: &str = ".rbxswitch.toml";
 

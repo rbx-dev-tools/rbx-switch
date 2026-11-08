@@ -1,15 +1,11 @@
 [package]
 name = "rbx-switch"
-# Starts at 0.1.0 rather than continuing rbx-cli's 0.11.0. Nothing was ever
-# released from that number line carrying this tool, so inheriting it would
-# claim a history of releases that does not exist.
 version = "0.2.0"
 edition = "2021"
 # Set by a dependency, not by our code: our own sources need 1.82, and the
 # number below is the highest `rust-version` in the resolved graph (clap 4.6
-# and hashbrown 0.17 both declare 1.85). Lower than rbx-cli's 1.88, which was
-# `image` via `rbx-core` — neither of which comes along. It moves when a
-# dependency moves it; the `msrv` CI job is what stops it moving silently.
+# and hashbrown 0.17 both declare 1.85). It moves when a dependency moves it;
+# the `msrv` CI job is what stops it moving silently.
 rust-version = "1.85"
 license = "MPL-2.0"
 description = "Switch between signed-in Roblox Studio accounts from the command line"

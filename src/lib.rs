@@ -22,12 +22,10 @@ use crate::credential::{Account, CredentialStore};
 /// before or after the subcommand: `rbx-switch --no-color list` and
 /// `rbx-switch list --no-color` both work.
 ///
-/// This is what is left of the `rbx_core::GlobalFlags` this crate used to
-/// borrow from the `rbx-cli` workspace. That struct carried seven flags about
-/// Open Cloud auth and `rbxplace.toml` resolution, none of which this tool
-/// ever read — it took the reference and ignored it. Standing alone, the two
-/// flags below are the ones a Studio account switcher genuinely has, and both
-/// are wired to behaviour rather than accepted and dropped.
+/// An earlier version accepted seven more flags, about Open Cloud auth and
+/// place resolution, and never read any of them. The two below are the ones a
+/// Studio account switcher genuinely has, and both are wired to behaviour
+/// rather than accepted and dropped.
 #[derive(Args, Debug, Clone, Default)]
 pub struct GlobalFlags {
     /// Never colour the output.
