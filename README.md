@@ -14,14 +14,14 @@ Switch between Roblox Studio accounts from the command line.
 With [mise](https://mise.jdx.dev) or [Rokit](https://github.com/rojo-rbx/rokit), either of which pins the latest release in your project's config:
 
 ```bash
-mise use --pin github:rbx-dev-tools/rbx-switch
-rokit add rbx-dev-tools/rbx-switch   # or, with Rokit
+mise use --pin github:rbx-forge/rbx-switch
+rokit add rbx-forge/rbx-switch   # or, with Rokit
 ```
 
-Or take the Windows binary from the [releases page](https://github.com/rbx-dev-tools/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
+Or take the Windows binary from the [releases page](https://github.com/rbx-forge/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
 
 ```bash
-cargo install --git https://github.com/rbx-dev-tools/rbx-switch --locked
+cargo install --git https://github.com/rbx-forge/rbx-switch --locked
 ```
 
 ## Usage
