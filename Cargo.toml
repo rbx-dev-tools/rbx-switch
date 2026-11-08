@@ -1,6 +1,6 @@
 [package]
 name = "rbx-account"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Set by a dependency, not by our code: our own sources need 1.82, and the
 # number below is the highest `rust-version` in the resolved graph (clap 4.6
