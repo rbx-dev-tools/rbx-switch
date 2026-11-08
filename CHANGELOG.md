@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`--player`** switches the Roblox Player instead of Studio, with the same accounts and aliases: `rbx-account qa --player`. Pass `--studio` too to switch both. It asks `auth.roblox.com` for a sign-in ticket with the account's Studio session and starts the Player with it, so any account signed in to Studio works. Windows only.
+- **`--force`**: `--player` restarts the Player, closing an open one and any game in progress, so it is refused while a Player is open unless `--force` is passed.
+
 ## [0.3.0] - 2026-11-08
 
 ### Changed

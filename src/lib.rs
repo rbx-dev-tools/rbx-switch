@@ -1,8 +1,10 @@
 //! Switch between Roblox Studio accounts. Cross-platform credential store
-//! (Windows registry + Credential Manager today; macOS stub).
+//! (Windows registry + Credential Manager today; macOS stub). With
+//! `--player`, the same accounts switch the Roblox Player too.
 
 mod config;
 mod credential;
+mod player;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -52,6 +54,42 @@ pub struct GlobalFlags {
     pub json: bool,
 }
 
+/// Which app a switch applies to. Studio when neither flag is given, so
+/// every command written before `--player` existed means what it meant.
+///
+/// Flags rather than a `studio` / `player` subcommand level: the account is
+/// what the command is about, and the Player has no account list of its own.
+/// Any account with a Studio session can be switched to in either app.
+#[derive(Args, Debug, Clone, Copy, Default)]
+pub struct Targets {
+    /// Switch Studio. The default; only needed alongside `--player`, to
+    /// switch both.
+    #[arg(long, global = true)]
+    pub studio: bool,
+
+    /// Switch the Roblox Player instead of Studio.
+    ///
+    /// Asks auth.roblox.com for a single-use sign-in ticket with the
+    /// account's Studio session, then starts the Player on its home screen
+    /// with it. The Player stays signed in as that account afterwards.
+    /// Refused while a Player is open, unless `--force`. Windows only.
+    #[arg(long, global = true)]
+    pub player: bool,
+
+    /// With `--player`, switch even though a Player is open.
+    ///
+    /// Switching starts a new Player, which closes the open one a few
+    /// seconds later, game in progress included.
+    #[arg(long, global = true)]
+    pub force: bool,
+}
+
+impl Targets {
+    fn studio(self) -> bool {
+        self.studio || !self.player
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct SwitchCli {
     #[command(subcommand)]
@@ -59,6 +97,9 @@ pub struct SwitchCli {
 
     /// Switch directly by alias or username (shorthand for `rbx-account use <name>`).
     pub name: Option<String>,
+
+    #[command(flatten)]
+    pub targets: Targets,
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,6 +122,24 @@ pub fn run(cli: SwitchCli, global: &GlobalFlags) -> Result<()> {
         colored::control::set_override(false);
     }
 
+    let targets = cli.targets;
+    if targets.force && !targets.player {
+        bail!("--force only applies to --player: a Studio switch closes nothing.");
+    }
+    if targets.player
+        && matches!(
+            cli.command,
+            Some(SwitchCommands::List | SwitchCommands::Current)
+        )
+    {
+        // Refused rather than ignored: `current --player` printing Studio's
+        // account would be a confident wrong answer.
+        bail!(
+            "`list` and `current` read Studio only: the Player keeps no account this \
+             tool can read back. --player applies to switching."
+        );
+    }
+
     let store = get_store()?;
     let config = Config::load()?;
 
@@ -89,12 +148,12 @@ pub fn run(cli: SwitchCli, global: &GlobalFlags) -> Result<()> {
         Some(SwitchCommands::Current) if global.json => json_current(&*store),
         Some(SwitchCommands::List) => cmd_list(&*store, &config),
         Some(SwitchCommands::Current) => cmd_current(&*store),
-        Some(SwitchCommands::Use { name }) => cmd_switch(&*store, &config, &name),
+        Some(SwitchCommands::Use { name }) => cmd_switch(&*store, &config, &name, targets),
         None => {
             if let Some(name) = cli.name {
-                cmd_switch(&*store, &config, &name)
+                cmd_switch(&*store, &config, &name, targets)
             } else {
-                cmd_interactive(&*store, global)
+                cmd_interactive(&*store, global, targets)
             }
         }
     }
@@ -231,7 +290,12 @@ fn cmd_current(store: &dyn CredentialStore) -> Result<()> {
     Ok(())
 }
 
-fn cmd_switch(store: &dyn CredentialStore, config: &Config, name: &str) -> Result<()> {
+fn cmd_switch(
+    store: &dyn CredentialStore,
+    config: &Config,
+    name: &str,
+    targets: Targets,
+) -> Result<()> {
     let accounts = store.list_accounts()?;
     let resolved = resolve_account(&accounts, config, name)?;
 
@@ -240,33 +304,115 @@ fn cmd_switch(store: &dyn CredentialStore, config: &Config, name: &str) -> Resul
         .find(|a| a.user_id == resolved.user_id)
         .ok_or_else(|| anyhow!("Account not found: {name}"))?;
 
-    store.set_user_id(&resolved.user_id)?;
-    println!(
-        "{} {} ({})",
-        "Switched to".green(),
-        account.username.cyan(),
-        account.user_id.dimmed(),
-    );
+    switch(store, account, targets)?;
 
     // Which file named this account, and the reminder that the switch outlives
-    // the directory it was made in. Studio has one signed-in account for the
-    // whole machine, so a project-local alias can leave the next checkout
-    // signed in as somebody it never mentions.
+    // the directory it was made in. Studio and the Player each have one
+    // signed-in account for the whole machine, so a project-local alias can
+    // leave the next checkout signed in as somebody it never mentions.
     if let Some(source) = resolved.via {
         println!(
             "  {} {} {}",
             "alias from".dimmed(),
             source.describe().dimmed(),
-            "- Studio stays on this account until you switch again".dimmed(),
+            format!("- {} until you switch again", stays_on(targets)).dimmed(),
         );
     }
 
     Ok(())
 }
 
-fn cmd_interactive(store: &dyn CredentialStore, global: &GlobalFlags) -> Result<()> {
+fn stays_on(targets: Targets) -> &'static str {
+    match (targets.studio(), targets.player) {
+        (true, true) => "Studio and the Player stay on this account",
+        (false, true) => "the Player stays on this account",
+        _ => "Studio stays on this account",
+    }
+}
+
+/// Applies one switch to every target.
+///
+/// Everything that can fail without changing anything runs first: the
+/// Player check, the session lookup and the ticket request. Only then is
+/// Studio's id rewritten and the Player opened, so a refused ticket leaves
+/// both apps as they were rather than Studio switched and the Player not.
+fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> Result<()> {
+    let player_uri = if targets.player {
+        Some(player_launch(store, account, targets.force)?)
+    } else {
+        None
+    };
+
+    if targets.studio() {
+        store.set_user_id(&account.user_id)?;
+        let label = if targets.player {
+            "Switched Studio to"
+        } else {
+            "Switched to"
+        };
+        println!(
+            "{} {} ({})",
+            label.green(),
+            account.username.cyan(),
+            account.user_id.dimmed(),
+        );
+    }
+
+    if let Some(uri) = player_uri {
+        store.open_player(&uri)?;
+        println!(
+            "{} {} ({}) {}",
+            "Switched the Player to".green(),
+            account.username.cyan(),
+            account.user_id.dimmed(),
+            "- it opens signed in within a few seconds".dimmed(),
+        );
+    }
+
+    Ok(())
+}
+
+/// The `roblox-player:` URI that signs the Player in as `account`.
+fn player_launch(store: &dyn CredentialStore, account: &Account, force: bool) -> Result<String> {
+    store.ensure_player_installed()?;
+
+    // A ticket launch does not reach the open Player: it starts a new one,
+    // and the open one exits 5 to 9 seconds later (measured twice on
+    // 2026-11-08), disconnecting any game in progress. Checked before the
+    // ticket is requested, so a refusal spends nothing.
+    if !force && store.player_running()? {
+        bail!(
+            "The Roblox Player is open. Switching starts a new Player and closes this \
+             one, game in progress included. Close it first, or pass --force."
+        );
+    }
+
+    let who = &account.username;
+    let session = store.session(&account.user_id)?.ok_or_else(|| {
+        anyhow!(
+            "Studio lists {who} but holds no session for it. \
+             Sign in to Studio as {who} once, then retry."
+        )
+    })?;
+
+    let ticket = player::request_ticket(&player::HttpTransport::new(), &session, who)?;
+    Ok(player::launch_uri(&ticket, player::now_ms()))
+}
+
+fn cmd_interactive(
+    store: &dyn CredentialStore,
+    global: &GlobalFlags,
+    targets: Targets,
+) -> Result<()> {
     let accounts = store.list_accounts()?;
-    let current = store.current_user_id()?;
+    // The `*` marks Studio's account. For a Player-only switch there is no
+    // known current account to mark, and marking Studio's would suggest the
+    // Player is on it.
+    let current = if targets.studio() {
+        store.current_user_id()?
+    } else {
+        None
+    };
 
     if accounts.is_empty() {
         println!(
@@ -307,14 +453,7 @@ fn cmd_interactive(store: &dyn CredentialStore, global: &GlobalFlags) -> Result<
         .interact_opt()?;
 
     if let Some(idx) = selection {
-        let account = &accounts[idx];
-        store.set_user_id(&account.user_id)?;
-        println!(
-            "{} {} ({})",
-            "Switched to".green(),
-            account.username.cyan(),
-            account.user_id.dimmed(),
-        );
+        switch(store, &accounts[idx], targets)?;
     }
 
     Ok(())
