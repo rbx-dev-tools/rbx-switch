@@ -15,7 +15,7 @@
 //!
 //! `launchmode:app` opens the Player on its home screen rather than joining a
 //! place: switching is this tool's job, and joining is left to whatever runs
-//! next (`rbx open --play`, the website, the Player itself).
+//! next (the website, the Player itself).
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,6 +113,10 @@ impl HttpTransport {
         let agent = ureq::Agent::config_builder()
             // The 403 carries the CSRF token: it is a step, not a failure.
             .http_status_as_error(false)
+            // The session goes to auth.roblox.com and nowhere else: no
+            // redirect is followed, and nothing is sent over plain HTTP.
+            .max_redirects(0)
+            .https_only(true)
             .user_agent(concat!("rbx-account/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
