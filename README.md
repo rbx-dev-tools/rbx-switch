@@ -4,6 +4,11 @@ Switch between Roblox Studio accounts from the command line.
 
 `rbx-switch` reads the accounts signed into Roblox Studio and lets you switch between them without opening Studio. This is useful for headless workflows (e.g. switching before running [Lune](https://github.com/lune-org/lune) scripts that use `getAuthCookie`).
 
+## Requirements
+
+- **Windows.** macOS is a stub and Linux has no Studio; see [Platform support](#platform-support).
+- Roblox Studio with every account you want to switch between already signed in once. The tool switches between those accounts; it does not sign anyone in.
+
 ## Install
 
 ```bash
@@ -13,7 +18,7 @@ rokit add rbx-dev-tools/rbx-switch
 Or take the Windows binary from the [releases page](https://github.com/rbx-dev-tools/rbx-switch/releases), which ships a zip and a `SHA256SUMS` alongside it, or build from source:
 
 ```bash
-cargo install --git https://github.com/rbx-dev-tools/rbx-switch
+cargo install --git https://github.com/rbx-dev-tools/rbx-switch --locked
 ```
 
 ## Usage
