@@ -1,4 +1,4 @@
-// macOS support — NOT TESTED, based on rbx_cookie patterns
+// macOS support: NOT TESTED, based on rbx_cookie patterns
 // Requires a Mac with Roblox Studio installed to verify
 
 use anyhow::{anyhow, Result};
@@ -21,7 +21,7 @@ impl CredentialStore for MacCredentialStore {
         //
         // TODO: Implement when Mac access is available
         Err(anyhow!(
-            "macOS support is not yet tested — contributions welcome!"
+            "macOS support is not yet tested. Contributions welcome!"
         ))
     }
 
@@ -32,14 +32,14 @@ impl CredentialStore for MacCredentialStore {
         //
         // TODO: Implement when Mac access is available
         Err(anyhow!(
-            "macOS support is not yet tested — contributions welcome!"
+            "macOS support is not yet tested. Contributions welcome!"
         ))
     }
 
     fn set_user_id(&self, _user_id: &str) -> Result<()> {
         // TODO: Implement when Mac access is available
         Err(anyhow!(
-            "macOS support is not yet tested — contributions welcome!"
+            "macOS support is not yet tested. Contributions welcome!"
         ))
     }
 }
