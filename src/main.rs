@@ -15,9 +15,10 @@ use rbx_account::{GlobalFlags, SwitchCli};
 #[command(
     name = "rbx-account",
     version,
-    about = "Switch between signed-in Roblox Studio accounts",
+    about = "Switch the Roblox account Studio and the Player are signed in as",
     long_about = "Switch between the Roblox accounts signed into Studio, without opening \
-                  Studio. Windows only today; the macOS credential store is a stub.\n\n\
+                  Studio. `--player` switches the Roblox Player the same way, without \
+                  opening it. Windows only today; the macOS credential store is a stub.\n\n\
                   With no account named, an interactive picker opens."
 )]
 struct Cli {

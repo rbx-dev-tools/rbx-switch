@@ -8,11 +8,11 @@ edition = "2021"
 # the `msrv` CI job is what stops it moving silently.
 rust-version = "1.85"
 license = "MPL-2.0"
-description = "Switch between signed-in Roblox Studio accounts from the command line"
+description = "Switch the Roblox account Studio and the Player are signed in as, from the command line"
 repository = "https://github.com/rbx-forge/rbx-account"
 homepage = "https://github.com/rbx-forge/rbx-account"
 authors = ["rbx-forge"]
-keywords = ["roblox", "studio", "cli", "accounts", "windows"]
+keywords = ["roblox", "studio", "player", "cli", "accounts"]
 categories = ["command-line-utilities", "game-development"]
 readme = "README.md"
 
