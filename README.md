@@ -1,6 +1,6 @@
 # rbx-account
 
-Switch the Roblox Studio account that is signed in, from the command line, without opening Studio. Useful before a script that reads Studio's session, such as a [Lune](https://github.com/lune-org/lune) script using `getAuthCookie`, or any tool that borrows Studio's cookie.
+Switch the Roblox account that Studio, or the Player with `--player`, is signed in as, from the command line, without opening either. Useful before a script that reads Studio's session, such as a [Lune](https://github.com/lune-org/lune) script using `getAuthCookie`, or any tool that borrows Studio's cookie.
 
 ```bash
 rbx-account list              # signed-in accounts, * marks the active one
