@@ -6,9 +6,13 @@
 use anyhow::{anyhow, Context, Result};
 use std::slice;
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, TRUE};
+use base64::Engine as _;
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE, TRUE};
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -25,6 +29,10 @@ const USERID_TARGET: &str = "https://www.roblox.com:RobloxStudioAuthuserid";
 const SESSION_TARGET_PREFIX: &str = "https://www.roblox.com:RobloxStudioAuth.ROBLOSECURITY";
 const REGISTRY_PATH: &str =
     r"SOFTWARE\Roblox\RobloxStudio\LoggedInUsersStore\https:\www.roblox.com";
+/// The Player's cookie store, under `%LOCALAPPDATA%`. JSON holding
+/// `CookiesVersion` and `CookiesData`: the cookies, encrypted with DPAPI for
+/// the current Windows user, no extra entropy, then base64.
+const PLAYER_COOKIES: &str = r"Roblox\LocalStorage\RobloxCookies.dat";
 
 pub struct WindowsCredentialStore;
 
@@ -247,6 +255,109 @@ impl CredentialStore for WindowsCredentialStore {
             ));
         }
         Ok(())
+    }
+
+    fn write_player_session(&self, session: &Session) -> Result<()> {
+        let path = dirs::data_local_dir()
+            .context("Could not locate %LOCALAPPDATA%")?
+            .join(PLAYER_COOKIES);
+        let raw = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "Could not read {}. Open the Roblox Player and sign in once, then retry.",
+                path.display()
+            )
+        })?;
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Store {
+            cookies_version: String,
+            cookies_data: String,
+        }
+        let store: Store = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not in the expected format", path.display()))?;
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let encrypted = base64
+            .decode(store.cookies_data.trim())
+            .with_context(|| format!("{} is not in the expected format", path.display()))?;
+        let cookies = String::from_utf8(dpapi(&encrypted, false)?)
+            .context("The Player's cookie store is not text")?;
+
+        let cookies = crate::player::replace_session(&cookies, session).context(
+            "Open the Roblox Player and sign in once, or pass --force to open it signed in",
+        )?;
+        let data = base64.encode(dpapi(cookies.as_bytes(), true)?);
+
+        // Checked again at the last moment: a Player started since the first
+        // check would write its own store back over this one when it exits.
+        if self.player_running()? {
+            return Err(anyhow!(
+                "The Roblox Player was opened during the switch. Close it, then retry."
+            ));
+        }
+
+        // The keys in the order the Player writes them, through a file beside
+        // the store renamed over it, so an interrupted write leaves the old
+        // store whole rather than half of a new one.
+        let json = format!(
+            "{{\"CookiesVersion\":{},\"CookiesData\":{}}}",
+            serde_json::to_string(&store.cookies_version)?,
+            serde_json::to_string(&data)?,
+        );
+        let temp = path.with_extension("dat.rbx-account");
+        std::fs::write(&temp, json)
+            .with_context(|| format!("Could not write {}", temp.display()))?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("Could not replace {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Runs DPAPI one way or the other, for the current Windows user. The two
+/// calls share a signature apart from the description argument, which neither
+/// direction needs here.
+fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>> {
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    unsafe {
+        let ok = if protect {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok != TRUE {
+            return Err(anyhow!(
+                "Windows could not {} the Player's cookie store: {}",
+                if protect { "encrypt" } else { "decrypt" },
+                std::io::Error::last_os_error()
+            ));
+        }
+        let bytes = slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        LocalFree(output.pbData as _);
+        Ok(bytes)
     }
 }
 

@@ -1,17 +1,26 @@
 //! Switching the account the Roblox Player is signed in as.
 //!
-//! Studio and the Player keep separate sessions, and the Player has no file
-//! this tool could rewrite the way `RobloxStudioAuthuserid` is rewritten for
-//! Studio. What it does accept is the launch the website sends when somebody
-//! presses Play: a `roblox-player:` URI carrying `gameinfo:<ticket>`, a
-//! single-use authentication ticket issued for one account. The Player redeems
-//! the ticket and, measured on Windows on 2026-11-08, stays signed in as that
-//! account afterwards. So a ticket is a switch, not a one-off join.
+//! Studio and the Player keep separate sessions. Both paths below start from a
+//! single-use authentication ticket, requested from `auth.roblox.com` with the
+//! account's own Studio session: the ticket the website gets when somebody
+//! presses Play.
 //!
-//! The ticket comes from `auth.roblox.com`, requested with the account's own
-//! Studio session. That makes this the one path in the tool that reads a
-//! session and makes a network call; the session goes to `auth.roblox.com`
-//! and nowhere else, and is never printed.
+//! **Player closed (the default).** The ticket is redeemed here, for a session
+//! of the Player's own, and that session replaces `.ROBLOSECURITY` in the
+//! Player's cookie store. Nothing is launched: the Player opens signed in as
+//! the account next time it starts, the way a Studio switch only rewrites
+//! `RobloxStudioAuthuserid`. Measured on Windows on 2026-11-09: swapping the
+//! session alone, every other cookie kept, is enough.
+//!
+//! **`--force`.** The ticket goes into a `roblox-player:` URI instead, and the
+//! Player redeems it. That starts a Player signed in as the account, and one
+//! already open exits a few seconds later (measured 2026-11-08). It is the only
+//! path while a Player is open, since an open Player rewrites its cookie store
+//! when it exits.
+//!
+//! This is the one part of the tool that reads a session and makes network
+//! calls. Sessions go to Roblox's own hosts over HTTPS, never through a
+//! redirect, and are never printed.
 //!
 //! `launchmode:app` opens the Player on its home screen rather than joining a
 //! place: switching is this tool's job, and joining is left to whatever runs
@@ -23,6 +32,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 
 const TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket";
+const REDEEM_URL: &str = "https://auth.roblox.com/v1/authentication-ticket/redeem";
+const AUTHENTICATED_URL: &str = "https://users.roblox.com/v1/users/authenticated";
+
+/// The cookie the session lives in, in the Player's store as in a browser.
+const SESSION_COOKIE: &str = ".ROBLOSECURITY";
 
 /// The value of an account's `.ROBLOSECURITY` cookie.
 ///
@@ -43,7 +57,7 @@ impl Session {
     }
 
     fn cookie_header(&self) -> String {
-        format!(".ROBLOSECURITY={}", self.0)
+        format!("{SESSION_COOKIE}={}", self.0)
     }
 }
 
@@ -157,6 +171,145 @@ impl TicketTransport for HttpTransport {
             ticket: header("rbx-authentication-ticket"),
         })
     }
+}
+
+impl RedeemTransport for HttpTransport {
+    fn redeem(&self, ticket: &str, csrf_token: Option<&str>) -> Result<RedeemResponse> {
+        let mut request = self
+            .agent
+            .post(REDEEM_URL)
+            .header("Referer", "https://www.roblox.com/")
+            // Without it the endpoint refuses the ticket: this is how the
+            // Player announces a ticket sign-in.
+            .header("RBXAuthenticationNegotiation", "1")
+            .header("Content-Type", "application/json");
+        if let Some(token) = csrf_token {
+            request = request.header("x-csrf-token", token);
+        }
+
+        let body = serde_json::json!({ "authenticationTicket": ticket }).to_string();
+        let response = request
+            .send(body.as_str())
+            .context("Could not reach auth.roblox.com")?;
+
+        let session = response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(session_from_set_cookie);
+
+        Ok(RedeemResponse {
+            status: response.status().as_u16(),
+            csrf_token: response
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
+            session,
+        })
+    }
+}
+
+impl HttpTransport {
+    /// The user id a session belongs to. Checked before a session is written
+    /// anywhere, so a ticket that came back for somebody else cannot sign the
+    /// Player in as them.
+    pub fn user_id(&self, session: &Session) -> Result<String> {
+        let mut response = self
+            .agent
+            .get(AUTHENTICATED_URL)
+            .header("Cookie", session.cookie_header())
+            .call()
+            .context("Could not reach users.roblox.com")?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            bail!("Roblox did not say whose the new session is (HTTP {status})");
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Me {
+            id: u64,
+        }
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .context("Unexpected answer from users.roblox.com")?;
+        let me: Me =
+            serde_json::from_str(&body).context("Unexpected answer from users.roblox.com")?;
+        Ok(me.id.to_string())
+    }
+}
+
+/// The session in one `Set-Cookie` header, if that header sets it.
+fn session_from_set_cookie(header: &str) -> Option<Session> {
+    let value = header.strip_prefix(SESSION_COOKIE)?.strip_prefix('=')?;
+    Session::parse(value.split(';').next()?)
+}
+
+/// What one POST to the redeem endpoint answered.
+#[derive(Debug, Default)]
+pub struct RedeemResponse {
+    pub status: u16,
+    pub csrf_token: Option<String>,
+    pub session: Option<Session>,
+}
+
+/// One POST to the redeem endpoint. A trait for the same reason as
+/// [`TicketTransport`].
+pub trait RedeemTransport {
+    fn redeem(&self, ticket: &str, csrf_token: Option<&str>) -> Result<RedeemResponse>;
+}
+
+/// Trades a ticket for a new session, as the Player does when it is launched
+/// with one. The session is the Player's own: Studio's is not shared, so
+/// signing out of one app does not sign out the other.
+///
+/// The endpoint is answered with the same CSRF exchange as the ticket request.
+pub fn redeem_ticket(transport: &dyn RedeemTransport, ticket: &str) -> Result<Session> {
+    let mut response = transport.redeem(ticket, None)?;
+
+    if response.status == 403 {
+        if let Some(token) = response.csrf_token.take() {
+            response = transport.redeem(ticket, Some(&token))?;
+        }
+    }
+
+    match response.status {
+        200 => response.session.with_context(|| {
+            "Roblox redeemed the sign-in ticket without setting a session. \
+             The endpoint may have changed."
+        }),
+        status => bail!("Roblox did not redeem the sign-in ticket (HTTP {status})"),
+    }
+}
+
+/// Puts `session` in place of the one in the Player's cookie store.
+///
+/// `store` is the store decrypted: Netscape cookie lines (domain, subdomains,
+/// path, secure, expiry, name, value, separated by tabs) joined by `"; "`.
+/// Only the value of `.ROBLOSECURITY` changes; every other cookie, and the
+/// session's own expiry, stays as it was.
+pub fn replace_session(store: &str, session: &Session) -> Result<String> {
+    let mut found = false;
+    let cookies: Vec<String> = store
+        .split("; ")
+        .map(|cookie| {
+            let mut fields: Vec<&str> = cookie.split('\t').collect();
+            if fields.len() == 7 && fields[5] == SESSION_COOKIE {
+                found = true;
+                fields[6] = &session.0;
+                fields.join("\t")
+            } else {
+                cookie.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        bail!("the Player is signed out, so it holds no session to replace");
+    }
+    Ok(cookies.join("; "))
 }
 
 /// The URI that signs the Player in with `ticket` and opens it on its home
@@ -291,6 +444,92 @@ mod tests {
     fn a_session_never_prints() {
         let printed = format!("{:?}", session());
         assert!(!printed.contains("WARNING"), "{printed}");
+    }
+
+    /// A store shaped like the Player's: the session among cookies that must
+    /// survive the swap untouched, one of them holding spaces.
+    const STORE: &str = "#HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t0\t.RBXIDCHECK\tid-check; \
+        .roblox.com\tTRUE\t/\tFALSE\t1828783200\tRBXEventTrackerV2\tCreateDate=11/9/2026 05:19:55&rbxid=1234567890; \
+        #HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t1828783200\t.ROBLOSECURITY\t_|WARNING:-old-session; \
+        #HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t1828783200\trbxas\tabcdef";
+
+    #[test]
+    fn only_the_session_value_changes() {
+        let replaced = replace_session(STORE, &session()).unwrap();
+
+        assert_eq!(
+            replaced,
+            STORE.replace(
+                "_|WARNING:-old-session",
+                "_|WARNING:-DO-NOT-SHARE-THIS.--aaaaBBBBccccDDDD"
+            )
+        );
+        assert!(
+            replaced.contains("\t1828783200\t.ROBLOSECURITY\t"),
+            "the expiry is kept"
+        );
+    }
+
+    #[test]
+    fn a_store_without_a_session_is_refused_rather_than_guessed_at() {
+        let signed_out = "#HttpOnly_.roblox.com\tTRUE\t/\tFALSE\t0\tGuestData\tUserID=-1";
+        let error = replace_session(signed_out, &session()).unwrap_err();
+        assert!(error.to_string().contains("signed out"), "{error}");
+    }
+
+    #[test]
+    fn a_cookie_whose_value_mentions_the_session_name_is_left_alone() {
+        let store = "x.com\tTRUE\t/\tFALSE\t0\tnote\t.ROBLOSECURITY; \
+            #HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t0\t.ROBLOSECURITY\t_|WARNING:-old";
+        let replaced = replace_session(store, &session()).unwrap();
+        assert!(
+            replaced.starts_with("x.com\tTRUE\t/\tFALSE\t0\tnote\t.ROBLOSECURITY; "),
+            "{replaced}"
+        );
+    }
+
+    #[test]
+    fn the_session_is_read_from_its_own_set_cookie_only() {
+        let set = ".ROBLOSECURITY=_|WARNING:-new; domain=.roblox.com; path=/; secure; HttpOnly";
+        assert_eq!(session_from_set_cookie(set).unwrap().0, "_|WARNING:-new");
+        assert!(session_from_set_cookie("RBXSessionTracker=abc; path=/").is_none());
+        assert!(session_from_set_cookie(".ROBLOSECURITYX=_|WARNING:-x").is_none());
+        // Roblox clears the cookie this way on sign-out: not a session.
+        assert!(session_from_set_cookie(".ROBLOSECURITY=; expires=Thu, 01 Jan 1970").is_none());
+    }
+
+    struct Redeems(RefCell<Vec<RedeemResponse>>);
+
+    impl RedeemTransport for Redeems {
+        fn redeem(&self, _: &str, _: Option<&str>) -> Result<RedeemResponse> {
+            Ok(self.0.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn a_redeem_answers_its_csrf_challenge_too() {
+        let transport = Redeems(RefCell::new(vec![
+            RedeemResponse {
+                status: 403,
+                csrf_token: Some("token123".into()),
+                session: None,
+            },
+            RedeemResponse {
+                status: 200,
+                csrf_token: None,
+                session: Some(session()),
+            },
+        ]));
+        assert!(redeem_ticket(&transport, "ticket-abc").is_ok());
+    }
+
+    #[test]
+    fn a_redeem_without_a_session_is_an_error() {
+        let transport = Redeems(RefCell::new(vec![RedeemResponse {
+            status: 200,
+            ..Default::default()
+        }]));
+        assert!(redeem_ticket(&transport, "ticket-abc").is_err());
     }
 
     #[test]

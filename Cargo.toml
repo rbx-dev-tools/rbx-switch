@@ -33,13 +33,16 @@ toml = "0.8"
 colored = "2"
 dialoguer = "0.11"
 dirs = "6"
-# Only `--player` uses it: two blocking requests to auth.roblox.com. Blocking
-# rather than an async client because there is nothing to overlap.
+# Only `--player` uses it: a few blocking requests to Roblox. Blocking rather
+# than an async client because there is nothing to overlap.
 ureq = "3"
 
 [target.'cfg(windows)'.dependencies]
+# The Player's cookie store is base64 around DPAPI.
+base64 = "0.23"
 windows-sys = { version = "0.59", features = [
     "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Shell",
