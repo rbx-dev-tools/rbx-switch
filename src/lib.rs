@@ -69,17 +69,17 @@ pub struct Targets {
 
     /// Switch the Roblox Player instead of Studio.
     ///
-    /// Asks auth.roblox.com for a single-use sign-in ticket with the
-    /// account's Studio session, then starts the Player on its home screen
-    /// with it. The Player stays signed in as that account afterwards.
-    /// Refused while a Player is open, unless `--force`. Windows only.
+    /// Nothing is opened: the closed Player starts signed in as the account
+    /// next time, like a Studio switch. It gets a session of its own, from a
+    /// sign-in ticket requested with the account's Studio session. Refused
+    /// while a Player is open, unless `--force`. Windows only.
     #[arg(long, global = true)]
     pub player: bool,
 
-    /// With `--player`, switch even though a Player is open.
+    /// With `--player`, open the Player signed in as the account now.
     ///
-    /// Switching starts a new Player, which closes the open one a few
-    /// seconds later, game in progress included.
+    /// The only way to switch an open Player: a new one starts, and the open
+    /// one exits a few seconds later, game in progress included.
     #[arg(long, global = true)]
     pub force: bool,
 }
@@ -330,18 +330,52 @@ fn stays_on(targets: Targets) -> &'static str {
     }
 }
 
+/// How a Player switch lands.
+enum PlayerSwitch {
+    /// The Player is closed: its cookie store gets this session, and it opens
+    /// signed in with it next time. Nothing is launched.
+    Store(player::Session),
+    /// `--force`: this `roblox-player:` URI starts the Player signed in.
+    Launch(String),
+}
+
 /// Applies one switch to every target.
 ///
 /// Everything that can fail without changing anything runs first: the
-/// Player check, the session lookup and the ticket request. Only then is
-/// Studio's id rewritten and the Player opened, so a refused ticket leaves
-/// both apps as they were rather than Studio switched and the Player not.
+/// Player check, the session lookup, the ticket and its redeem. Then the
+/// Player's switch, the step most likely to fail, and Studio's last, so a
+/// refusal leaves both apps as they were rather than Studio switched and the
+/// Player not.
 fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> Result<()> {
-    let player_uri = if targets.player {
-        Some(player_launch(store, account, targets.force)?)
+    let player = if targets.player {
+        Some(player_prepare(store, account, targets.force)?)
     } else {
         None
     };
+
+    match player {
+        Some(PlayerSwitch::Store(session)) => {
+            store.write_player_session(&session)?;
+            println!(
+                "{} {} ({}) {}",
+                "Switched the Player to".green(),
+                account.username.cyan(),
+                account.user_id.dimmed(),
+                "- it opens signed in next time".dimmed(),
+            );
+        }
+        Some(PlayerSwitch::Launch(uri)) => {
+            store.open_player(&uri)?;
+            println!(
+                "{} {} ({}) {}",
+                "Switched the Player to".green(),
+                account.username.cyan(),
+                account.user_id.dimmed(),
+                "- it opens signed in within a few seconds".dimmed(),
+            );
+        }
+        None => {}
+    }
 
     if targets.studio() {
         store.set_user_id(&account.user_id)?;
@@ -358,32 +392,28 @@ fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> R
         );
     }
 
-    if let Some(uri) = player_uri {
-        store.open_player(&uri)?;
-        println!(
-            "{} {} ({}) {}",
-            "Switched the Player to".green(),
-            account.username.cyan(),
-            account.user_id.dimmed(),
-            "- it opens signed in within a few seconds".dimmed(),
-        );
-    }
-
     Ok(())
 }
 
-/// The `roblox-player:` URI that signs the Player in as `account`.
-fn player_launch(store: &dyn CredentialStore, account: &Account, force: bool) -> Result<String> {
+/// Everything a Player switch needs, fetched before anything changes.
+fn player_prepare(
+    store: &dyn CredentialStore,
+    account: &Account,
+    force: bool,
+) -> Result<PlayerSwitch> {
     store.ensure_player_installed()?;
 
-    // A ticket launch does not reach the open Player: it starts a new one,
-    // and the open one exits 5 to 9 seconds later (measured twice on
-    // 2026-11-08), disconnecting any game in progress. Checked before the
-    // ticket is requested, so a refusal spends nothing.
+    // An open Player writes its cookie store back when it exits, over
+    // anything written meanwhile, so the store can only be switched closed.
+    // A ticket launch does reach it, by starting a new Player: the open one
+    // exits 5 to 9 seconds later (measured twice on 2026-11-08), disconnecting
+    // any game in progress. Checked before the ticket is requested, so a
+    // refusal spends nothing.
     if !force && store.player_running()? {
         bail!(
-            "The Roblox Player is open. Switching starts a new Player and closes this \
-             one, game in progress included. Close it first, or pass --force."
+            "The Roblox Player is open, and it rewrites its sign-in when it exits. \
+             Close it first, or pass --force to restart it signed in, game in \
+             progress included."
         );
     }
 
@@ -395,8 +425,24 @@ fn player_launch(store: &dyn CredentialStore, account: &Account, force: bool) ->
         )
     })?;
 
-    let ticket = player::request_ticket(&player::HttpTransport::new(), &session, who)?;
-    Ok(player::launch_uri(&ticket, player::now_ms()))
+    let transport = player::HttpTransport::new();
+    let ticket = player::request_ticket(&transport, &session, who)?;
+    if force {
+        return Ok(PlayerSwitch::Launch(player::launch_uri(
+            &ticket,
+            player::now_ms(),
+        )));
+    }
+
+    let player_session = player::redeem_ticket(&transport, &ticket)?;
+    let owner = transport.user_id(&player_session)?;
+    if owner != account.user_id {
+        bail!(
+            "Roblox issued a session for user {owner}, not {who} ({}). Nothing was changed.",
+            account.user_id
+        );
+    }
+    Ok(PlayerSwitch::Store(player_session))
 }
 
 fn cmd_interactive(

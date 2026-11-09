@@ -59,4 +59,8 @@ impl CredentialStore for MacCredentialStore {
     fn open_player(&self, _uri: &str) -> Result<()> {
         Err(anyhow!("--player is Windows only for now."))
     }
+
+    fn write_player_session(&self, _session: &Session) -> Result<()> {
+        Err(anyhow!("--player is Windows only for now."))
+    }
 }

@@ -92,9 +92,11 @@ rbx-account --player                 # pick from a list
 
 Any account signed in to Studio can be switched to: the Player has no account list of its own here.
 
-**It restarts the Player.** Switching starts a new Player on its home screen, signed in as the account, and the one already open exits a few seconds later, leaving any game in progress. So `--player` is refused while a Player is open; close it, or pass `--force` to switch anyway. The Player stays on the account afterwards.
+**Nothing opens.** Like a Studio switch, `--player` changes the account and launches nothing: the Player starts signed in as it next time you open it, and stays on it.
 
-**Wait before joining a game.** `rbx-account qa --player && <something that joins a game>` races: the join reaches the old Player just before it is closed. Join once the new Player shows its home screen.
+**The Player has to be closed**, because an open one writes its sign-in back when it exits. While it is open, `--player` is refused; close it, or pass `--force`. `--force` starts a new Player signed in as the account right away, and the open one exits a few seconds later, leaving any game in progress.
+
+**After `--force`, wait before joining a game.** `rbx-account qa --player --force && <something that joins a game>` races: the join reaches the old Player just before it is closed. Join once the new Player shows its home screen.
 
 `list` and `current` stay about Studio. The Player keeps no account this tool can read back, so `current --player` is refused rather than answered with Studio's account.
 
@@ -104,7 +106,7 @@ Windows only.
 
 On Windows, Studio lists signed-in accounts in the registry (`LoggedInUsersStore`) and keeps the active user id in Credential Manager (`RobloxStudioAuthuserid`). `rbx-account` rewrites the latter. On macOS the locations are known but unverified; contributions from someone with a Mac and Studio are welcome.
 
-For `--player`, it reads the account's Studio session from Credential Manager and sends it to `auth.roblox.com` to get a single-use sign-in ticket, the one the website gets when you press Play. It then opens a `roblox-player:` link carrying that ticket. The session goes to `auth.roblox.com` and nowhere else, and is never printed. This is the only network call the tool makes, and only `--player` makes it.
+For `--player`, it reads the account's Studio session from Credential Manager and sends it to `auth.roblox.com` to get a single-use sign-in ticket, the one the website gets when you press Play. It redeems that ticket for a session of the Player's own, checks with `users.roblox.com` that the session is the account's, and writes it into the Player's cookie store (`%LOCALAPPDATA%\Roblox\LocalStorage\RobloxCookies.dat`, encrypted for your Windows user), changing nothing else in it. With `--force` it opens a `roblox-player:` link carrying the ticket instead. Sessions go to Roblox's own hosts over HTTPS, never through a redirect, and are never printed. These are the only network calls the tool makes, and only `--player` makes them.
 
 ## License
 

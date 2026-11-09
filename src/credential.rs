@@ -35,4 +35,8 @@ pub trait CredentialStore {
 
     /// Hand a `roblox-player:` URI to the system.
     fn open_player(&self, uri: &str) -> Result<()>;
+
+    /// Put `session` in the closed Player's cookie store, so it opens signed
+    /// in with it next time.
+    fn write_player_session(&self, session: &Session) -> Result<()>;
 }
