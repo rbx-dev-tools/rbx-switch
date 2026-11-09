@@ -5,29 +5,19 @@
 //! account's own Studio session: the ticket the website gets when somebody
 //! presses Play.
 //!
-//! **Player closed (the default).** The ticket is redeemed here, for a session
-//! of the Player's own, and that session replaces `.ROBLOSECURITY` in the
-//! Player's cookie store. Nothing is launched: the Player opens signed in as
-//! the account next time it starts, the way a Studio switch only rewrites
-//! `RobloxStudioAuthuserid`. Measured on Windows on 2026-11-09: swapping the
-//! session alone, every other cookie kept, is enough.
-//!
-//! **`--force`.** The ticket goes into a `roblox-player:` URI instead, and the
-//! Player redeems it. That starts a Player signed in as the account, and one
-//! already open exits a few seconds later (measured 2026-11-08). It is the only
-//! path while a Player is open, since an open Player rewrites its cookie store
-//! when it exits.
+//! The ticket is redeemed here, for a session of the Player's own, and that
+//! session replaces `.ROBLOSECURITY` in the Player's cookie store. Nothing is
+//! launched: the Player opens signed in as the account next time it starts,
+//! the way a Studio switch only rewrites `RobloxStudioAuthuserid`. Measured on
+//! Windows on 2026-11-09: swapping the session alone, every other cookie kept,
+//! is enough. An open Player rewrites its store when it exits, so it has to be
+//! closed first (`--force` closes it).
 //!
 //! This is the one part of the tool that reads a session and makes network
 //! calls. Sessions go to Roblox's own hosts over HTTPS, never through a
 //! redirect, and are never printed.
-//!
-//! `launchmode:app` opens the Player on its home screen rather than joining a
-//! place: switching is this tool's job, and joining is left to whatever runs
-//! next (the website, the Player itself).
 
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
@@ -312,27 +302,6 @@ pub fn replace_session(store: &str, session: &Session) -> Result<String> {
     Ok(cookies.join("; "))
 }
 
-/// The URI that signs the Player in with `ticket` and opens it on its home
-/// screen.
-///
-/// The fields are the website's launch minus everything about a place.
-/// `launchtime` is the moment of the launch in milliseconds and
-/// `browsertrackerid` an id the website would take from its tracking cookie;
-/// any number is accepted, so the launch time is reused.
-pub fn launch_uri(ticket: &str, launch_ms: u128) -> String {
-    format!(
-        "roblox-player:1+launchmode:app+gameinfo:{ticket}+launchtime:{launch_ms}\
-         +browsertrackerid:{launch_ms}+channel:"
-    )
-}
-
-pub fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_200_without_a_ticket_is_an_error_not_an_empty_launch() {
+    fn a_200_without_a_ticket_is_an_error_not_an_empty_ticket() {
         let transport = Scripted::new(vec![TicketResponse {
             status: 200,
             ticket: Some(String::new()),
@@ -530,13 +499,5 @@ mod tests {
             ..Default::default()
         }]));
         assert!(redeem_ticket(&transport, "ticket-abc").is_err());
-    }
-
-    #[test]
-    fn the_uri_opens_the_app_and_names_no_place() {
-        let uri = launch_uri("ticket-abc", 1_700_000_000_000);
-        assert!(uri.starts_with("roblox-player:1+launchmode:app+"), "{uri}");
-        assert!(uri.contains("+gameinfo:ticket-abc+"), "{uri}");
-        assert!(!uri.contains("placelauncherurl"), "{uri}");
     }
 }

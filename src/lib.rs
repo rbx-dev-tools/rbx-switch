@@ -69,17 +69,15 @@ pub struct Targets {
 
     /// Switch the Roblox Player instead of Studio.
     ///
-    /// Nothing is opened: the closed Player starts signed in as the account
-    /// next time, like a Studio switch. It gets a session of its own, from a
+    /// Nothing is opened: the Player starts signed in as the account next
+    /// time, like a Studio switch. It gets a session of its own, from a
     /// sign-in ticket requested with the account's Studio session. Refused
     /// while a Player is open, unless `--force`. Windows only.
     #[arg(long, global = true)]
     pub player: bool,
 
-    /// With `--player`, open the Player signed in as the account now.
-    ///
-    /// The only way to switch an open Player: a new one starts, and the open
-    /// one exits a few seconds later, game in progress included.
+    /// With `--player`, close an open Player first, game in progress
+    /// included. It is not reopened.
     #[arg(long, global = true)]
     pub force: bool,
 }
@@ -330,51 +328,28 @@ fn stays_on(targets: Targets) -> &'static str {
     }
 }
 
-/// How a Player switch lands.
-enum PlayerSwitch {
-    /// The Player is closed: its cookie store gets this session, and it opens
-    /// signed in with it next time. Nothing is launched.
-    Store(player::Session),
-    /// `--force`: this `roblox-player:` URI starts the Player signed in.
-    Launch(String),
-}
-
 /// Applies one switch to every target.
 ///
 /// Everything that can fail without changing anything runs first: the
 /// Player check, the session lookup, the ticket and its redeem. Then the
 /// Player's switch, the step most likely to fail, and Studio's last, so a
 /// refusal leaves both apps as they were rather than Studio switched and the
-/// Player not.
+/// Player not. With `--force`, the Player is closed only once its new session
+/// is in hand, so a refused ticket closes nothing.
 fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> Result<()> {
-    let player = if targets.player {
-        Some(player_prepare(store, account, targets.force)?)
-    } else {
-        None
-    };
-
-    match player {
-        Some(PlayerSwitch::Store(session)) => {
-            store.write_player_session(&session)?;
-            println!(
-                "{} {} ({}) {}",
-                "Switched the Player to".green(),
-                account.username.cyan(),
-                account.user_id.dimmed(),
-                "- it opens signed in next time".dimmed(),
-            );
+    if targets.player {
+        let session = player_prepare(store, account, targets.force)?;
+        if targets.force && store.close_player()? {
+            println!("{}", "Closed the Roblox Player".yellow());
         }
-        Some(PlayerSwitch::Launch(uri)) => {
-            store.open_player(&uri)?;
-            println!(
-                "{} {} ({}) {}",
-                "Switched the Player to".green(),
-                account.username.cyan(),
-                account.user_id.dimmed(),
-                "- it opens signed in within a few seconds".dimmed(),
-            );
-        }
-        None => {}
+        store.write_player_session(&session)?;
+        println!(
+            "{} {} ({}) {}",
+            "Switched the Player to".green(),
+            account.username.cyan(),
+            account.user_id.dimmed(),
+            "- it opens signed in next time".dimmed(),
+        );
     }
 
     if targets.studio() {
@@ -395,25 +370,21 @@ fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> R
     Ok(())
 }
 
-/// Everything a Player switch needs, fetched before anything changes.
+/// The session a Player switch writes, fetched before anything changes.
 fn player_prepare(
     store: &dyn CredentialStore,
     account: &Account,
     force: bool,
-) -> Result<PlayerSwitch> {
+) -> Result<player::Session> {
     store.ensure_player_installed()?;
 
     // An open Player writes its cookie store back when it exits, over
     // anything written meanwhile, so the store can only be switched closed.
-    // A ticket launch does reach it, by starting a new Player: the open one
-    // exits 5 to 9 seconds later (measured twice on 2026-11-08), disconnecting
-    // any game in progress. Checked before the ticket is requested, so a
-    // refusal spends nothing.
+    // Checked before the ticket is requested, so a refusal spends nothing.
     if !force && store.player_running()? {
         bail!(
             "The Roblox Player is open, and it rewrites its sign-in when it exits. \
-             Close it first, or pass --force to restart it signed in, game in \
-             progress included."
+             Close it first, or pass --force to close it, game in progress included."
         );
     }
 
@@ -427,13 +398,6 @@ fn player_prepare(
 
     let transport = player::HttpTransport::new();
     let ticket = player::request_ticket(&transport, &session, who)?;
-    if force {
-        return Ok(PlayerSwitch::Launch(player::launch_uri(
-            &ticket,
-            player::now_ms(),
-        )));
-    }
-
     let player_session = player::redeem_ticket(&transport, &ticket)?;
     let owner = transport.user_id(&player_session)?;
     if owner != account.user_id {
@@ -442,7 +406,7 @@ fn player_prepare(
             account.user_id
         );
     }
-    Ok(PlayerSwitch::Store(player_session))
+    Ok(player_session)
 }
 
 fn cmd_interactive(
