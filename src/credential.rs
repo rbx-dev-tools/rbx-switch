@@ -33,8 +33,9 @@ pub trait CredentialStore {
     /// Whether a Roblox Player process is running right now.
     fn player_running(&self) -> Result<bool>;
 
-    /// Hand a `roblox-player:` URI to the system.
-    fn open_player(&self, uri: &str) -> Result<()>;
+    /// Close every running Roblox Player, game in progress included, and wait
+    /// for them to exit. `false` when none was running.
+    fn close_player(&self) -> Result<bool>;
 
     /// Put `session` in the closed Player's cookie store, so it opens signed
     /// in with it next time.

@@ -7,7 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use std::slice;
 
 use base64::Engine as _;
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE, TRUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
@@ -18,8 +20,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
 
 use crate::credential::{Account, CredentialStore};
 use crate::player::Session;
@@ -191,70 +194,32 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn player_running(&self) -> Result<bool> {
-        const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
-
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot == INVALID_HANDLE_VALUE {
-                return Err(anyhow!(
-                    "Could not list running processes: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-
-            let mut found = false;
-            let mut more = Process32FirstW(snapshot, &mut entry) == TRUE;
-            while more {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                if name.eq_ignore_ascii_case(PLAYER_EXE) {
-                    found = true;
-                    break;
-                }
-                more = Process32NextW(snapshot, &mut entry) == TRUE;
-            }
-
-            CloseHandle(snapshot);
-            Ok(found)
-        }
+        Ok(!player_pids()?.is_empty())
     }
 
-    fn open_player(&self, uri: &str) -> Result<()> {
-        // ShellExecuteW, not `explorer "<uri>"`. explorer is what launches
-        // Studio elsewhere in this toolset, but measured on 2026-11-08 it
-        // hands the Player a ticket the Player then fails to redeem (HTTP 403
-        // on authentication-ticket/redeem, "authentication error" dialog),
-        // while the very same ticket opened with ShellExecute signs in. The
-        // ticket is only letters, digits, `-` and `_`, so what explorer alters
-        // is not known; ShellExecute is what a browser and Start-Process use.
-        //
-        // The return value is greater than 32 on success, and an error code
-        // otherwise.
-        let file = to_wide(uri);
-        let verb = to_wide("open");
-        let result = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                verb.as_ptr(),
-                file.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        } as isize;
-        if result <= 32 {
-            return Err(anyhow!(
-                "Windows could not open the Roblox Player (ShellExecute error {result})"
-            ));
+    fn close_player(&self) -> Result<bool> {
+        let pids = player_pids()?;
+        for &pid in &pids {
+            // Terminated rather than asked to close: a Player that exits
+            // normally writes its cookie store first, and that write could
+            // land after the new session.
+            unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+                if handle.is_null() {
+                    // Already gone between the listing and now.
+                    continue;
+                }
+                let terminated = TerminateProcess(handle, 1) == TRUE;
+                let exited = WaitForSingleObject(handle, 10_000) == WAIT_OBJECT_0;
+                CloseHandle(handle);
+                if !terminated || !exited {
+                    return Err(anyhow!(
+                        "Could not close the Roblox Player (process {pid}). Close it, then retry."
+                    ));
+                }
+            }
         }
-        Ok(())
+        Ok(!pids.is_empty())
     }
 
     fn write_player_session(&self, session: &Session) -> Result<()> {
@@ -283,9 +248,8 @@ impl CredentialStore for WindowsCredentialStore {
         let cookies = String::from_utf8(dpapi(&encrypted, false)?)
             .context("The Player's cookie store is not text")?;
 
-        let cookies = crate::player::replace_session(&cookies, session).context(
-            "Open the Roblox Player and sign in once, or pass --force to open it signed in",
-        )?;
+        let cookies = crate::player::replace_session(&cookies, session)
+            .context("Open the Roblox Player and sign in once, close it, then retry")?;
         let data = base64.encode(dpapi(cookies.as_bytes(), true)?);
 
         // Checked again at the last moment: a Player started since the first
@@ -310,6 +274,42 @@ impl CredentialStore for WindowsCredentialStore {
         std::fs::rename(&temp, &path)
             .with_context(|| format!("Could not replace {}", path.display()))?;
         Ok(())
+    }
+}
+
+/// The process ids of every running Roblox Player.
+fn player_pids() -> Result<Vec<u32>> {
+    const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(anyhow!(
+                "Could not list running processes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut pids = Vec::new();
+        let mut more = Process32FirstW(snapshot, &mut entry) == TRUE;
+        while more {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if name.eq_ignore_ascii_case(PLAYER_EXE) {
+                pids.push(entry.th32ProcessID);
+            }
+            more = Process32NextW(snapshot, &mut entry) == TRUE;
+        }
+
+        CloseHandle(snapshot);
+        Ok(pids)
     }
 }
 

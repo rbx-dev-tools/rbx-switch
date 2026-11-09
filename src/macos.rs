@@ -56,7 +56,7 @@ impl CredentialStore for MacCredentialStore {
         Err(anyhow!("--player is Windows only for now."))
     }
 
-    fn open_player(&self, _uri: &str) -> Result<()> {
+    fn close_player(&self) -> Result<bool> {
         Err(anyhow!("--player is Windows only for now."))
     }
 

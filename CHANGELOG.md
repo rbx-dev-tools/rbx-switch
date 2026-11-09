@@ -4,7 +4,8 @@
 
 ### Changed
 
-- **`--player` no longer opens the Player.** Like a Studio switch, it changes the account and launches nothing: the closed Player starts signed in as the account next time. The sign-in ticket is redeemed by `rbx-account` itself, for a session of the Player's own, and written into the Player's cookie store; nothing else in the store changes. `--force` is how to switch an open Player: it starts a new one signed in, as `--player` did before.
+- **`--player` no longer opens the Player.** Like a Studio switch, it changes the account and launches nothing: the closed Player starts signed in as the account next time. The sign-in ticket is redeemed by `rbx-account` itself, for a session of the Player's own, and written into the Player's cookie store; nothing else in the store changes.
+- **`--force` closes an open Player instead of restarting it**, game in progress included, and does not reopen it.
 
 ## [0.4.0] - 2026-11-08
 
