@@ -15,8 +15,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use colored::Colorize as _;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE,
-    WAIT_OBJECT_0,
+    CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+    INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
@@ -569,20 +569,48 @@ fn identify(pid: u32, image: std::io::Result<String>) -> Result<Identity> {
 
 /// The full path of the program an opened process runs.
 fn image_path(process: &Handle) -> std::io::Result<String> {
-    let mut buffer = [0u16; 1024];
-    let mut len = buffer.len() as u32;
-    // SAFETY: `process` is open with PROCESS_QUERY_LIMITED_INFORMATION until
-    // its guard closes it, `buffer` holds `len` writable u16s, and `len` is a
-    // valid place for the count Windows writes back.
-    let ok = unsafe {
-        QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
-    };
-    if ok != TRUE {
-        return Err(std::io::Error::last_os_error());
+    read_growing(|buffer| {
+        let mut len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        // SAFETY: `process` is open with PROCESS_QUERY_LIMITED_INFORMATION
+        // until its guard closes it, `buffer` holds at least `len` writable
+        // u16s, and `len` is a valid place for the count Windows writes back.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+        };
+        if ok == TRUE {
+            Ok(len as usize)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+/// The longest path Windows has: 32,767 characters and the NUL.
+const MAX_PATH_CHARS: usize = 32_768;
+
+/// Runs `query` with a buffer that doubles each time it answers
+/// ERROR_INSUFFICIENT_BUFFER, up to the longest path Windows allows. `query`
+/// returns how many characters it wrote, without the NUL.
+fn read_growing(
+    mut query: impl FnMut(&mut [u16]) -> std::io::Result<usize>,
+) -> std::io::Result<String> {
+    let mut buffer = vec![0u16; 260];
+    loop {
+        match query(&mut buffer) {
+            Ok(len) => {
+                let written = buffer.get(..len).unwrap_or(&buffer);
+                return Ok(String::from_utf16_lossy(written));
+            }
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+                    && buffer.len() < MAX_PATH_CHARS =>
+            {
+                let longer = (buffer.len() * 2).min(MAX_PATH_CHARS);
+                buffer.resize(longer, 0);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    // On success `len` is the number of characters written, without the NUL.
-    let written = buffer.get(..len as usize).unwrap_or(&buffer);
-    Ok(String::from_utf16_lossy(written))
 }
 
 /// A handle this module opened, closed on every path out.
@@ -1026,6 +1054,33 @@ mod tests {
             identify(1234, Ok(lookalike.into())).unwrap(),
             Identity::Other(_)
         ));
+    }
+
+    /// A query that answers ERROR_INSUFFICIENT_BUFFER until the buffer holds
+    /// `path`, the way QueryFullProcessImageNameW does.
+    fn query_for(path: &str) -> impl FnMut(&mut [u16]) -> std::io::Result<usize> + '_ {
+        move |buffer| {
+            let wide: Vec<u16> = path.encode_utf16().collect();
+            if buffer.len() <= wide.len() {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_INSUFFICIENT_BUFFER as i32,
+                ));
+            }
+            buffer[..wide.len()].copy_from_slice(&wide);
+            Ok(wide.len())
+        }
+    }
+
+    #[test]
+    fn a_long_image_path_is_read_whole() {
+        let long = format!(r"C:\{}\RobloxPlayerBeta.exe", "d".repeat(2000));
+        assert_eq!(read_growing(query_for(&long)).unwrap(), long);
+    }
+
+    #[test]
+    fn a_path_longer_than_windows_allows_is_an_error() {
+        let endless = "d".repeat(MAX_PATH_CHARS);
+        assert!(read_growing(query_for(&endless)).is_err());
     }
 
     #[test]
