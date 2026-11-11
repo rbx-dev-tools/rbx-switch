@@ -6,8 +6,12 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::slice;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE,
@@ -227,58 +231,160 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn write_player_session(&self, session: &Session) -> Result<()> {
-        let path = dirs::data_local_dir()
-            .context("Could not locate %LOCALAPPDATA%")?
-            .join(PLAYER_COOKIES);
-        let raw = std::fs::read_to_string(&path).with_context(|| {
+        OpenStore::open(StoreAccess::player()?)?.write(session)
+    }
+}
+
+/// What to say when the store holds no session to replace.
+const SIGN_IN_ONCE: &str = "Open the Roblox Player and sign in once, close it, then retry";
+
+/// Beside the store: the previous store, kept one switch deep.
+const BACKUP_SUFFIX: &str = ".rbx-account.bak";
+/// Beside the store: the new store, until it is renamed over the old one.
+const TEMP_SUFFIX: &str = ".rbx-account.tmp";
+
+/// The Player's cookie store file: the two keys this tool reads, in the order
+/// the Player writes them, and every other key kept as it was, so a key a
+/// later Player adds survives a switch.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct StoreFile {
+    cookies_version: String,
+    cookies_data: String,
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where a cookie store lives, how its cookies are sealed, and how to tell
+/// whether a Player is open. The real one is the Player's file under DPAPI;
+/// the tests point one at a temp file, with a stand-in cipher.
+struct StoreAccess {
+    path: PathBuf,
+    seal: fn(&[u8]) -> Result<Vec<u8>>,
+    unseal: fn(&[u8]) -> Result<Vec<u8>>,
+    player_open: fn() -> Result<bool>,
+}
+
+impl StoreAccess {
+    fn player() -> Result<Self> {
+        Ok(Self {
+            path: dirs::data_local_dir()
+                .context("Could not locate %LOCALAPPDATA%")?
+                .join(PLAYER_COOKIES),
+            seal: |data| dpapi(data, true),
+            unseal: |data| dpapi(data, false),
+            player_open: || Ok(!player_pids()?.is_empty()),
+        })
+    }
+}
+
+/// A cookie store read, decrypted and checked to hold a session, with
+/// nothing changed yet.
+struct OpenStore {
+    access: StoreAccess,
+    /// The file as read, kept as the backup when the new store is written.
+    raw: String,
+    file: StoreFile,
+    cookies: String,
+}
+
+impl OpenStore {
+    fn open(access: StoreAccess) -> Result<Self> {
+        let raw = fs::read_to_string(&access.path).with_context(|| {
             format!(
                 "Could not read {}. Open the Roblox Player and sign in once, then retry.",
-                path.display()
+                access.path.display()
             )
         })?;
+        let (file, cookies) = parse_store(&access, &raw)?;
+        Ok(Self {
+            access,
+            raw,
+            file,
+            cookies,
+        })
+    }
 
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Store {
-            cookies_version: String,
-            cookies_data: String,
-        }
-        let store: Store = serde_json::from_str(&raw)
-            .with_context(|| format!("{} is not in the expected format", path.display()))?;
-        let base64 = base64::engine::general_purpose::STANDARD;
-        let encrypted = base64
-            .decode(store.cookies_data.trim())
-            .with_context(|| format!("{} is not in the expected format", path.display()))?;
-        let cookies = String::from_utf8(dpapi(&encrypted, false)?)
-            .context("The Player's cookie store is not text")?;
+    /// Puts `session` in the store, every other cookie and key kept.
+    fn write(self, session: &Session) -> Result<()> {
+        let Self {
+            access,
+            raw,
+            file,
+            cookies,
+        } = self;
 
-        let cookies = crate::player::replace_session(&cookies, session)
-            .context("Open the Roblox Player and sign in once, close it, then retry")?;
-        let data = base64.encode(dpapi(cookies.as_bytes(), true)?);
+        let cookies = crate::player::replace_session(&cookies, session).context(SIGN_IN_ONCE)?;
+        let sealed = (access.seal)(cookies.as_bytes())?;
+        let json = serde_json::to_string(&StoreFile {
+            cookies_data: BASE64.encode(sealed),
+            ..file
+        })?;
 
         // Checked again at the last moment: a Player started since the first
         // check would write its own store back over this one when it exits.
-        if self.player_running()? {
-            return Err(anyhow!(
-                "The Roblox Player was opened during the switch. Close it, then retry."
-            ));
+        if (access.player_open)()? {
+            bail!("The Roblox Player was opened during the switch. Close it, then retry.");
         }
 
-        // The keys in the order the Player writes them, through a file beside
-        // the store renamed over it, so an interrupted write leaves the old
-        // store whole rather than half of a new one.
-        let json = format!(
-            "{{\"CookiesVersion\":{},\"CookiesData\":{}}}",
-            serde_json::to_string(&store.cookies_version)?,
-            serde_json::to_string(&data)?,
-        );
-        let temp = path.with_extension("dat.rbx-account");
-        std::fs::write(&temp, json)
-            .with_context(|| format!("Could not write {}", temp.display()))?;
-        std::fs::rename(&temp, &path)
-            .with_context(|| format!("Could not replace {}", path.display()))?;
-        Ok(())
+        replace_file(&access.path, json.as_bytes(), raw.as_bytes())
     }
+}
+
+/// Reads a store file down to its cookies, refusing anything this tool could
+/// not write a session into.
+fn parse_store(access: &StoreAccess, raw: &str) -> Result<(StoreFile, String)> {
+    let path = access.path.display();
+    let file: StoreFile = serde_json::from_str(raw)
+        .with_context(|| format!("{path} is not in the expected format"))?;
+    let sealed = BASE64
+        .decode(file.cookies_data.trim())
+        .with_context(|| format!("{path} is not in the expected format"))?;
+    let cookies = String::from_utf8((access.unseal)(&sealed)?)
+        .context("The Player's cookie store is not text")?;
+    if !crate::player::holds_session(&cookies) {
+        bail!(
+            "The Roblox Player is signed out, so it holds no session to replace. {SIGN_IN_ONCE}."
+        );
+    }
+    Ok((file, cookies))
+}
+
+/// Replaces `path` with `contents`, and keeps `previous` beside it.
+///
+/// The new store goes to a temp file in the same directory, flushed to disk,
+/// then renamed over the store, so an interrupted write leaves the old store
+/// whole rather than half of a new one. The backup is one deep: it holds the
+/// store as it was before the latest switch.
+fn replace_file(path: &Path, contents: &[u8], previous: &[u8]) -> Result<()> {
+    let backup = beside(path, BACKUP_SUFFIX);
+    write_synced(&backup, previous)
+        .with_context(|| format!("Could not keep a backup at {}", backup.display()))?;
+
+    let temp = beside(path, TEMP_SUFFIX);
+    let replaced = write_synced(&temp, contents)
+        .with_context(|| format!("Could not write {}", temp.display()))
+        .and_then(|()| {
+            fs::rename(&temp, path).with_context(|| format!("Could not replace {}", path.display()))
+        });
+    if replaced.is_err() {
+        // Best effort: the error being returned is the one worth reading.
+        let _ = fs::remove_file(&temp);
+    }
+    replaced
+}
+
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// `path` with `suffix` added to its file name.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// The process ids of every running Roblox Player.
@@ -558,6 +664,216 @@ mod tests {
             Some("https://example.com/a.png")
         );
         assert_eq!(accounts[1].profile_pic_url, None);
+    }
+
+    // A stand-in for DPAPI: what it seals, only it unseals.
+    fn fake_seal(data: &[u8]) -> Result<Vec<u8>> {
+        Ok([b"sealed:".as_slice(), data].concat())
+    }
+
+    fn fake_unseal(data: &[u8]) -> Result<Vec<u8>> {
+        data.strip_prefix(b"sealed:")
+            .map(<[u8]>::to_vec)
+            .context("not sealed by the fake")
+    }
+
+    fn player_closed() -> Result<bool> {
+        Ok(false)
+    }
+
+    fn player_open() -> Result<bool> {
+        Ok(true)
+    }
+
+    /// A store shaped like the Player's: the session among cookies that must
+    /// survive the swap untouched.
+    const COOKIES: &str = "#HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t0\t.RBXIDCHECK\tid-check; \
+        #HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t1828783200\t.ROBLOSECURITY\t_|WARNING:-old-session; \
+        #HttpOnly_.roblox.com\tTRUE\t/\tTRUE\t1828783200\trbxas\tabcdef";
+
+    fn new_session() -> Session {
+        Session::parse("_|WARNING:-new-session").unwrap()
+    }
+
+    /// The store file around `cookies`, sealed with `seal`, with `extra`
+    /// spliced in after the two known keys.
+    fn store_json(cookies: &str, seal: fn(&[u8]) -> Result<Vec<u8>>, extra: &str) -> String {
+        let data = BASE64.encode(seal(cookies.as_bytes()).unwrap());
+        format!(r#"{{"CookiesVersion":"1","CookiesData":"{data}"{extra}}}"#)
+    }
+
+    /// A store in a temp directory, with the fake cipher.
+    fn fake_store(
+        contents: &str,
+        player_open: fn() -> Result<bool>,
+    ) -> (tempfile::TempDir, StoreAccess) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("RobloxCookies.dat");
+        fs::write(&path, contents).unwrap();
+        let access = StoreAccess {
+            path,
+            seal: fake_seal,
+            unseal: fake_unseal,
+            player_open,
+        };
+        (dir, access)
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_switch_keeps_every_key_and_cookie_it_does_not_own() {
+        let before = store_json(COOKIES, fake_seal, r#","LaterKey":{"kept":[1,2]}"#);
+        let (_dir, access) = fake_store(&before, player_closed);
+        let path = access.path.clone();
+
+        OpenStore::open(access)
+            .unwrap()
+            .write(&new_session())
+            .unwrap();
+
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with(r#"{"CookiesVersion":"1","CookiesData":""#),
+            "the known keys come first, in the Player's order: {after}"
+        );
+        let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(after["LaterKey"], serde_json::json!({ "kept": [1, 2] }));
+
+        let data = BASE64
+            .decode(after["CookiesData"].as_str().unwrap())
+            .unwrap();
+        let cookies = String::from_utf8(fake_unseal(&data).unwrap()).unwrap();
+        assert_eq!(
+            cookies,
+            COOKIES.replace("_|WARNING:-old-session", "_|WARNING:-new-session")
+        );
+    }
+
+    #[test]
+    fn the_previous_store_is_kept_beside_it_and_no_temp_file_is_left() {
+        let before = store_json(COOKIES, fake_seal, "");
+        let (dir, access) = fake_store(&before, player_closed);
+
+        OpenStore::open(access)
+            .unwrap()
+            .write(&new_session())
+            .unwrap();
+
+        assert_eq!(
+            files_in(dir.path()),
+            ["RobloxCookies.dat", "RobloxCookies.dat.rbx-account.bak"]
+        );
+        let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
+        assert_eq!(backup.unwrap(), before);
+    }
+
+    #[test]
+    fn a_store_that_cannot_take_a_session_is_refused_when_opened() {
+        let not_base64 = r#"{"CookiesVersion":"1","CookiesData":"%%%"}"#.to_string();
+        let not_sealed = store_json(COOKIES, |data| Ok(data.to_vec()), "");
+        let signed_out = store_json(
+            "x.com\tTRUE\t/\tFALSE\t0\tGuestData\tUserID=-1",
+            fake_seal,
+            "",
+        );
+        let cases = [
+            ("not JSON", "{not json".to_string(), "expected format"),
+            (
+                "no CookiesData",
+                r#"{"CookiesVersion":"1"}"#.to_string(),
+                "expected format",
+            ),
+            ("not base64", not_base64, "expected format"),
+            ("not sealed", not_sealed, "not sealed"),
+            ("signed out", signed_out, "signed out"),
+        ];
+
+        for (case, contents, expected) in cases {
+            let (dir, access) = fake_store(&contents, player_closed);
+            let error = match OpenStore::open(access) {
+                Ok(_) => panic!("{case}: opened"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(expected), "{case}: {error}");
+            assert_eq!(files_in(dir.path()), ["RobloxCookies.dat"], "{case}");
+        }
+    }
+
+    #[test]
+    fn a_missing_store_names_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = StoreAccess {
+            path: dir.path().join("RobloxCookies.dat"),
+            seal: fake_seal,
+            unseal: fake_unseal,
+            player_open: player_closed,
+        };
+        let error = OpenStore::open(access).err().unwrap().to_string();
+        assert!(error.contains("RobloxCookies.dat"), "{error}");
+        assert!(files_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_player_opened_during_the_switch_leaves_the_store_alone() {
+        let before = store_json(COOKIES, fake_seal, "");
+        let (dir, access) = fake_store(&before, player_open);
+        let path = access.path.clone();
+
+        let error = OpenStore::open(access)
+            .unwrap()
+            .write(&new_session())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("opened during"), "{error}");
+        assert_eq!(fs::read_to_string(path).unwrap(), before);
+        assert_eq!(files_in(dir.path()), ["RobloxCookies.dat"]);
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the store should be: the rename cannot replace it.
+        let path = dir.path().join("RobloxCookies.dat");
+        fs::create_dir(&path).unwrap();
+
+        assert!(replace_file(&path, b"new", b"old").is_err());
+        assert!(!dir
+            .path()
+            .join("RobloxCookies.dat.rbx-account.tmp")
+            .exists());
+    }
+
+    /// The real cipher, on a store this test sealed itself in a temp
+    /// directory.
+    #[test]
+    fn a_dpapi_store_round_trips() {
+        let seal: fn(&[u8]) -> Result<Vec<u8>> = |data| dpapi(data, true);
+        let (_dir, mut access) = fake_store(&store_json(COOKIES, seal, ""), player_closed);
+        access.seal = seal;
+        access.unseal = |data| dpapi(data, false);
+        let path = access.path.clone();
+
+        OpenStore::open(access)
+            .unwrap()
+            .write(&new_session())
+            .unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let data = BASE64
+            .decode(after["CookiesData"].as_str().unwrap())
+            .unwrap();
+        let cookies = String::from_utf8(dpapi(&data, false).unwrap()).unwrap();
+        assert!(cookies.contains("\t.ROBLOSECURITY\t_|WARNING:-new-session"));
     }
 
     #[test]
