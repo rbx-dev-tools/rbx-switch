@@ -11,6 +11,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -298,6 +299,7 @@ struct OpenStore {
 
 impl OpenStore {
     fn open(access: StoreAccess) -> Result<Self> {
+        remove_stray_temps(&access.path, SystemTime::now());
         let raw = fs::read_to_string(&access.path).with_context(|| {
             format!(
                 "Could not read {}. Open the Roblox Player and sign in once, then retry.",
@@ -426,6 +428,56 @@ fn temp_beside(path: &Path) -> PathBuf {
         path,
         &format!(".rbx-account.{}.{n}.tmp", std::process::id()),
     )
+}
+
+/// How old a temp file must be before it counts as left by a run that died:
+/// a live run writes and renames its own within milliseconds.
+const STRAY_AFTER: Duration = Duration::from_secs(60);
+
+/// Removes the temp files a run that died left beside the store. Each holds
+/// a whole encrypted session, so none is left lying around. Only files named
+/// exactly as [`temp_beside`] names them, and older than [`STRAY_AFTER`], are
+/// touched; anything else in the directory is never looked at twice. Best
+/// effort: a file that cannot be removed now is tried again next switch.
+fn remove_stray_temps(store: &Path, now: SystemTime) {
+    let (Some(dir), Some(store_name)) = (store.parent(), store.file_name()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let store_name = store_name.to_string_lossy();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !is_stray_temp_name(&store_name, &name.to_string_lossy()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let old = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STRAY_AFTER);
+        if metadata.is_file() && old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `name` is `<store_name>.rbx-account.<digits>.<digits>.tmp`, the shape of
+/// [`temp_beside`], and nothing looser.
+fn is_stray_temp_name(store_name: &str, name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(store_name)
+        .and_then(|rest| rest.strip_prefix(".rbx-account."))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    matches!(rest.split_once('.'), Some((pid, n)) if digits(pid) && digits(n))
 }
 
 /// Writes a file that must not exist yet, shared with nobody while it is
@@ -1163,6 +1215,62 @@ mod tests {
         let path = Path::new(r"C:\dev\scratch\RobloxCookies.dat");
         assert_ne!(temp_beside(path), temp_beside(path));
         assert_eq!(temp_beside(path).parent(), path.parent());
+    }
+
+    #[test]
+    fn only_the_exact_temp_shape_is_a_stray() {
+        let store = "RobloxCookies.dat";
+        assert!(is_stray_temp_name(
+            store,
+            "RobloxCookies.dat.rbx-account.1234.0.tmp"
+        ));
+        for name in [
+            "RobloxCookies.dat",
+            "RobloxCookies.dat.rbx-account.bak",
+            "RobloxCookies.dat.rbx-account.tmp",
+            "RobloxCookies.dat.rbx-account.1234.tmp",
+            "RobloxCookies.dat.rbx-account.12a4.0.tmp",
+            "RobloxCookies.dat.rbx-account.1234..tmp",
+            "RobloxCookies.dat.rbx-account.1234.0.1.tmp",
+            "RobloxCookies.dat.rbx-account.1234.0.tmp.keep",
+            "Other.dat.rbx-account.1234.0.tmp",
+            "notes.tmp",
+        ] {
+            assert!(!is_stray_temp_name(store, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn stray_temps_older_than_a_minute_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("RobloxCookies.dat");
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(120);
+        let touch = |name: &str, modified: SystemTime| {
+            let file = fs::File::create(dir.path().join(name)).unwrap();
+            file.set_modified(modified).unwrap();
+        };
+        touch("RobloxCookies.dat", old);
+        touch("RobloxCookies.dat.rbx-account.bak", old);
+        touch("RobloxCookies.dat.rbx-account.1234.0.tmp", old);
+        touch("RobloxCookies.dat.rbx-account.1234.1.tmp", now);
+        touch("RobloxCookies.dat.rbx-account.x.0.tmp", old);
+        touch("unrelated.tmp", old);
+        fs::create_dir(dir.path().join("RobloxCookies.dat.rbx-account.9.9.tmp")).unwrap();
+
+        remove_stray_temps(&store, now);
+
+        assert_eq!(
+            files_in(dir.path()),
+            [
+                "RobloxCookies.dat",
+                "RobloxCookies.dat.rbx-account.1234.1.tmp",
+                "RobloxCookies.dat.rbx-account.9.9.tmp",
+                "RobloxCookies.dat.rbx-account.bak",
+                "RobloxCookies.dat.rbx-account.x.0.tmp",
+                "unrelated.tmp",
+            ]
+        );
     }
 
     /// A temp file that exists is somebody else's: it is never written over.
