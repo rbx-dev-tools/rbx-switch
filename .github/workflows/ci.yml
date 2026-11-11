@@ -14,13 +14,16 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Windows only, on purpose. This tool reads the Studio account list out of the
-# Windows registry and writes the active user id into Windows Credential
-# Manager; on Linux `get_store()` returns an error and the platform modules do
-# not even compile in. A Linux job would therefore test the argument parser and
-# nothing else, and would report green on the day the Win32 calls broke. The
-# macOS module is a stub that returns "not yet tested" from every method, so a
-# macOS runner - billed at 10x - would buy no signal either.
+# Windows, apart from one macOS check. This tool reads the Studio account list
+# out of the Windows registry and writes the active user id into Windows
+# Credential Manager; on Linux `get_store()` returns an error and the platform
+# modules do not even compile in. A Linux job would therefore test the argument
+# parser and nothing else, and would report green on the day the Win32 calls
+# broke.
+#
+# Every cargo command that resolves dependencies takes `--locked`: CI tests the
+# graph in Cargo.lock, the one the release is built from, and fails rather than
+# quietly resolving a new one.
 jobs:
   test:
     # `cargo test` compiles and links every target, so it doubles as the build
@@ -32,7 +35,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo test --all-targets --verbose
+      - run: cargo test --locked --all-targets --verbose
+
+  macos:
+    # The macOS module is a stub, but it implements the same trait as the
+    # Windows one, and nothing else compiles it: without this job a change to
+    # the trait would break the macOS build unseen. A check, not a test: there
+    # is no behaviour to run. On a macOS runner rather than a cross check from
+    # Windows, because the TLS stack builds C code for its target.
+    name: Check (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - run: cargo check --locked --all-targets
 
   fmt:
     name: Rustfmt
@@ -51,7 +69,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   msrv:
     # rust-version in Cargo.toml is a promise to whoever builds from source.
@@ -67,4 +85,4 @@ jobs:
         with:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo check --all-targets
+      - run: cargo check --locked --all-targets
