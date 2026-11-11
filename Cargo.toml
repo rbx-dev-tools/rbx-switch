@@ -30,7 +30,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-colored = "2"
+colored = "3"
 dialoguer = "0.11"
 dirs = "6"
 # Only `--player` uses it: a few blocking requests to Roblox. Blocking rather
