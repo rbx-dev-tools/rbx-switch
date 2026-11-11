@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::credential::{Account, CredentialStore};
+use crate::credential::{Account, CredentialStore, PlayerStore};
 use crate::player::Session;
 
 const USERID_TARGET: &str = "https://www.roblox.com:RobloxStudioAuthuserid";
@@ -230,8 +230,14 @@ impl CredentialStore for WindowsCredentialStore {
         Ok(closed)
     }
 
-    fn write_player_session(&self, session: &Session) -> Result<()> {
-        OpenStore::open(StoreAccess::player()?)?.write(session)
+    fn open_player_store(&self) -> Result<Box<dyn PlayerStore>> {
+        Ok(Box::new(OpenStore::open(StoreAccess::player()?)?))
+    }
+}
+
+impl PlayerStore for OpenStore {
+    fn write_session(self: Box<Self>, session: &Session) -> Result<()> {
+        self.write(session)
     }
 }
 
@@ -282,7 +288,7 @@ impl StoreAccess {
 /// nothing changed yet.
 struct OpenStore {
     access: StoreAccess,
-    /// The file as read, kept as the backup when the new store is written.
+    /// The file as read, to tell whether it changed before the write.
     raw: String,
     file: StoreFile,
     cookies: String,
@@ -314,6 +320,18 @@ impl OpenStore {
             cookies,
         } = self;
 
+        // Read again: the store was checked before the ticket was fetched and
+        // the Player closed, and a Player may have rewritten it since. The
+        // store on disk now is the one that takes the session, and the one
+        // kept as the backup.
+        let current = fs::read_to_string(&access.path)
+            .with_context(|| format!("Could not read {}", access.path.display()))?;
+        let (file, cookies) = if current == raw {
+            (file, cookies)
+        } else {
+            parse_store(&access, &current)?
+        };
+
         let cookies = crate::player::replace_session(&cookies, session).context(SIGN_IN_ONCE)?;
         let sealed = (access.seal)(cookies.as_bytes())?;
         let json = serde_json::to_string(&StoreFile {
@@ -327,7 +345,7 @@ impl OpenStore {
             bail!("The Roblox Player was opened during the switch. Close it, then retry.");
         }
 
-        replace_file(&access.path, json.as_bytes(), raw.as_bytes())
+        replace_file(&access.path, json.as_bytes(), current.as_bytes())
     }
 }
 
@@ -836,6 +854,25 @@ mod tests {
         assert!(error.to_string().contains("opened during"), "{error}");
         assert_eq!(fs::read_to_string(path).unwrap(), before);
         assert_eq!(files_in(dir.path()), ["RobloxCookies.dat"]);
+    }
+
+    /// The store is checked before the ticket is fetched and the Player
+    /// closed; what is written is what is on disk at the end.
+    #[test]
+    fn a_store_rewritten_after_the_check_is_the_one_switched() {
+        let (dir, access) = fake_store(&store_json(COOKIES, fake_seal, ""), player_closed);
+        let path = access.path.clone();
+        let store = OpenStore::open(access).unwrap();
+
+        let rewritten = store_json(COOKIES, fake_seal, r#","Rewritten":true"#);
+        fs::write(&path, &rewritten).unwrap();
+        store.write(&new_session()).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["Rewritten"], true);
+        let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
+        assert_eq!(backup.unwrap(), rewritten);
     }
 
     #[test]
