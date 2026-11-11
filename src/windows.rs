@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -245,8 +246,6 @@ const SIGN_IN_ONCE: &str = "Open the Roblox Player and sign in once, close it, t
 
 /// Beside the store: the previous store, kept one switch deep.
 const BACKUP_SUFFIX: &str = ".rbx-account.bak";
-/// Beside the store: the new store, until it is renamed over the old one.
-const TEMP_SUFFIX: &str = ".rbx-account.tmp";
 
 /// The Player's cookie store file: the two keys this tool reads, in the order
 /// the Player writes them, and every other key kept as it was, so a key a
@@ -375,26 +374,55 @@ fn parse_store(access: &StoreAccess, raw: &str) -> Result<(StoreFile, String)> {
 /// store as it was before the latest switch.
 fn replace_file(path: &Path, contents: &[u8], previous: &[u8]) -> Result<()> {
     let backup = beside(path, BACKUP_SUFFIX);
-    write_synced(&backup, previous)
+    replace_synced(&backup, previous)
         .with_context(|| format!("Could not keep a backup at {}", backup.display()))?;
 
-    let temp = beside(path, TEMP_SUFFIX);
-    let replaced = write_synced(&temp, contents)
-        .with_context(|| format!("Could not write {}", temp.display()))
-        .and_then(|()| {
-            fs::rename(&temp, path).with_context(|| format!("Could not replace {}", path.display()))
-        });
-    if replaced.is_err() {
-        // Best effort: the error being returned is the one worth reading.
-        let _ = fs::remove_file(&temp);
-    }
-    replaced
+    replace_synced(path, contents)
 }
 
-fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
+/// Replaces `path` with `contents` through a temp file of its own in the same
+/// directory, flushed to disk before the rename.
+fn replace_synced(path: &Path, contents: &[u8]) -> Result<()> {
+    let temp = temp_beside(path);
+    write_new_synced(&temp, contents)
+        .with_context(|| format!("Could not write {}", temp.display()))?;
+    fs::rename(&temp, path).map_err(|error| {
+        // Best effort: the rename error is the one worth reading.
+        let _ = fs::remove_file(&temp);
+        anyhow!(error).context(format!("Could not replace {}", path.display()))
+    })
+}
+
+/// Tells this process's temp files apart from one another.
+static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A temp file name beside `path` that no other write uses: this process's
+/// id and a counter. Two runs at once each write their own file, so neither
+/// can rename the other's half-written one over the store.
+fn temp_beside(path: &Path) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    beside(
+        path,
+        &format!(".rbx-account.{}.{n}.tmp", std::process::id()),
+    )
+}
+
+/// Writes a file that must not exist yet, shared with nobody while it is
+/// open, and flushes it to disk. A file this call created and could not
+/// finish is removed.
+fn write_new_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(path)?;
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 /// `path` with `suffix` added to its file name.
@@ -1060,11 +1088,30 @@ mod tests {
         let path = dir.path().join("RobloxCookies.dat");
         fs::create_dir(&path).unwrap();
 
-        assert!(replace_file(&path, b"new", b"old").is_err());
-        assert!(!dir
-            .path()
-            .join("RobloxCookies.dat.rbx-account.tmp")
-            .exists());
+        assert!(replace_synced(&path, b"new").is_err());
+        let temps: Vec<_> = files_in(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "{temps:?}");
+    }
+
+    #[test]
+    fn every_write_has_a_temp_file_of_its_own() {
+        let path = Path::new(r"C:\dev\scratch\RobloxCookies.dat");
+        assert_ne!(temp_beside(path), temp_beside(path));
+        assert_eq!(temp_beside(path).parent(), path.parent());
+    }
+
+    /// A temp file that exists is somebody else's: it is never written over.
+    #[test]
+    fn a_temp_file_that_exists_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("taken.tmp");
+        fs::write(&temp, b"another run's").unwrap();
+
+        assert!(write_new_synced(&temp, b"ours").is_err());
+        assert_eq!(fs::read(&temp).unwrap(), b"another run's");
     }
 
     /// The real cipher, on a store this test sealed itself in a temp
