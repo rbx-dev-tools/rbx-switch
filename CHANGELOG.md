@@ -4,7 +4,7 @@
 
 ### Added
 
-- **`--player` keeps a backup of the Player's cookie store**, as `RobloxCookies.dat.rbx-account.bak` beside it: the store as it was before the latest switch. With the Player closed, copying it back over `RobloxCookies.dat` undoes that switch.
+- **`--player` keeps a backup of the Player's cookie store**, as `RobloxCookies.dat.rbx-account.bak` beside it: the store as it was before the latest switch. It is written before the sign-in ticket is requested or a Player closed, and a backup that cannot be written stops the switch with nothing changed. With the Player closed, copying it back over `RobloxCookies.dat` undoes that switch.
 
 ### Changed
 

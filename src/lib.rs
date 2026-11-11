@@ -342,7 +342,7 @@ fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> R
 /// Everything that can fail without changing anything runs first: the
 /// Player check, the session lookup, reading and checking the Player's
 /// cookie store, with `--force` opening and identifying every open Player,
-/// then the ticket and its redeem. Only then does anything change: the open
+/// the backup of the store, then the ticket and its redeem. Only then does anything change: the open
 /// Players are closed, the Player's store is written, and Studio is switched
 /// last. A refusal at any earlier step leaves both apps as they were, and a
 /// store that could not take the session, or a Player that could not be
@@ -434,6 +434,9 @@ fn player_prepare(
     } else {
         None
     };
+    // The last step before the irreversible ones: a backup that cannot be
+    // written stops the switch with nothing changed.
+    player_store.back_up()?;
     let player_session = exchange(&session, account)?;
     Ok(Prepared {
         store: player_store,
@@ -698,6 +701,10 @@ mod tests {
     struct FakePlayerStore(Steps);
 
     impl PlayerStore for FakePlayerStore {
+        fn back_up(&self) -> Result<()> {
+            self.0.take("back_up")
+        }
+
         fn write_session(self: Box<Self>, _: &player::Session) -> Result<()> {
             self.0.take("write_session")
         }
@@ -743,12 +750,21 @@ mod tests {
                 "session",
                 "open_player_store",
                 "open_players",
+                "back_up",
                 "exchange",
                 "close_players",
                 "write_session",
                 "set_user_id",
             ]
         );
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_written_stops_the_switch_before_the_ticket() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("back_up"));
+        assert!(result.is_err());
+        assert_eq!(steps.last(), Some(&"back_up"));
+        assert!(!steps.contains(&"exchange"), "{steps:?}");
     }
 
     #[test]

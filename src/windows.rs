@@ -236,6 +236,10 @@ impl CredentialStore for WindowsCredentialStore {
 }
 
 impl PlayerStore for OpenStore {
+    fn back_up(&self) -> Result<()> {
+        OpenStore::back_up(self)
+    }
+
     fn write_session(self: Box<Self>, session: &Session) -> Result<()> {
         self.write(session)
     }
@@ -309,6 +313,15 @@ impl OpenStore {
         })
     }
 
+    /// Keeps the store as it was read beside it, replacing the backup of the
+    /// switch before. One deep: it holds the store as it was before the
+    /// latest switch.
+    fn back_up(&self) -> Result<()> {
+        let backup = beside(&self.access.path, BACKUP_SUFFIX);
+        replace_synced(&backup, self.raw.as_bytes())
+            .with_context(|| format!("Could not keep a backup at {}", backup.display()))
+    }
+
     /// Puts `session` in the store, every other cookie and key kept.
     fn write(self, session: &Session) -> Result<()> {
         let Self {
@@ -320,8 +333,7 @@ impl OpenStore {
 
         // Read again: the store was checked before the ticket was fetched and
         // the Player closed, and a Player may have rewritten it since. The
-        // store on disk now is the one that takes the session, and the one
-        // kept as the backup.
+        // store on disk now is the one that takes the session.
         let current = fs::read_to_string(&access.path)
             .with_context(|| format!("Could not read {}", access.path.display()))?;
         let (file, cookies) = if current == raw {
@@ -343,7 +355,9 @@ impl OpenStore {
             bail!("The Roblox Player was opened during the switch. Close it, then retry.");
         }
 
-        replace_file(&access.path, json.as_bytes(), current.as_bytes())
+        // Through a temp file renamed over the store, so an interrupted write
+        // leaves the old store whole rather than half of a new one.
+        replace_synced(&access.path, json.as_bytes())
     }
 }
 
@@ -364,20 +378,6 @@ fn parse_store(access: &StoreAccess, raw: &str) -> Result<(StoreFile, String)> {
         );
     }
     Ok((file, cookies))
-}
-
-/// Replaces `path` with `contents`, and keeps `previous` beside it.
-///
-/// The new store goes to a temp file in the same directory, flushed to disk,
-/// then renamed over the store, so an interrupted write leaves the old store
-/// whole rather than half of a new one. The backup is one deep: it holds the
-/// store as it was before the latest switch.
-fn replace_file(path: &Path, contents: &[u8], previous: &[u8]) -> Result<()> {
-    let backup = beside(path, BACKUP_SUFFIX);
-    replace_synced(&backup, previous)
-        .with_context(|| format!("Could not keep a backup at {}", backup.display()))?;
-
-    replace_synced(path, contents)
 }
 
 /// Replaces `path` with `contents` through a temp file of its own in the same
@@ -987,10 +987,9 @@ mod tests {
         let before = store_json(COOKIES, fake_seal, "");
         let (dir, access) = fake_store(&before, player_closed);
 
-        OpenStore::open(access)
-            .unwrap()
-            .write(&new_session())
-            .unwrap();
+        let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
+        store.write(&new_session()).unwrap();
 
         assert_eq!(
             files_in(dir.path()),
@@ -998,6 +997,20 @@ mod tests {
         );
         let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
         assert_eq!(backup.unwrap(), before);
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_written_is_an_error_and_changes_nothing() {
+        let before = store_json(COOKIES, fake_seal, "");
+        let (dir, access) = fake_store(&before, player_closed);
+        let path = access.path.clone();
+        // A directory where the backup goes: the rename cannot replace it.
+        fs::create_dir(dir.path().join("RobloxCookies.dat.rbx-account.bak")).unwrap();
+
+        let error = OpenStore::open(access).unwrap().back_up().unwrap_err();
+
+        assert!(error.to_string().contains("backup"), "{error}");
+        assert_eq!(fs::read_to_string(path).unwrap(), before);
     }
 
     #[test]
@@ -1066,9 +1079,11 @@ mod tests {
     /// closed; what is written is what is on disk at the end.
     #[test]
     fn a_store_rewritten_after_the_check_is_the_one_switched() {
-        let (dir, access) = fake_store(&store_json(COOKIES, fake_seal, ""), player_closed);
+        let before = store_json(COOKIES, fake_seal, "");
+        let (dir, access) = fake_store(&before, player_closed);
         let path = access.path.clone();
         let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
 
         let rewritten = store_json(COOKIES, fake_seal, r#","Rewritten":true"#);
         fs::write(&path, &rewritten).unwrap();
@@ -1078,7 +1093,11 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["Rewritten"], true);
         let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
-        assert_eq!(backup.unwrap(), rewritten);
+        assert_eq!(
+            backup.unwrap(),
+            before,
+            "the backup is the store as checked"
+        );
     }
 
     #[test]
