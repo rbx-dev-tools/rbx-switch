@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::credential::{Account, CredentialStore, PlayerStore};
+use crate::credential::{Account, CredentialStore, OpenPlayers, PlayerStore};
 use crate::player::Session;
 
 pub struct MacCredentialStore;
@@ -56,7 +56,7 @@ impl CredentialStore for MacCredentialStore {
         Err(anyhow!("--player is Windows only for now."))
     }
 
-    fn close_player(&self) -> Result<bool> {
+    fn open_players(&self) -> Result<Box<dyn OpenPlayers>> {
         Err(anyhow!("--player is Windows only for now."))
     }
 

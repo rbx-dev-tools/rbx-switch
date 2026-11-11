@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
-use crate::credential::{Account, CredentialStore, PlayerStore};
+use crate::credential::{Account, CredentialStore, OpenPlayers, PlayerStore};
 use crate::player::Session;
 
 const USERID_TARGET: &str = "https://www.roblox.com:RobloxStudioAuthuserid";
@@ -221,15 +221,12 @@ impl CredentialStore for WindowsCredentialStore {
         Ok(!player_pids()?.is_empty())
     }
 
-    fn close_player(&self) -> Result<bool> {
-        let mut closed = false;
-        for pid in player_pids()? {
-            match close_process(pid)? {
-                Closed::Terminated => closed = true,
-                Closed::AlreadyGone => {}
-            }
-        }
-        Ok(closed)
+    fn open_players(&self) -> Result<Box<dyn OpenPlayers>> {
+        let opened = player_pids()?
+            .into_iter()
+            .map(|pid| (pid, open_process(pid)))
+            .collect();
+        Ok(Box::new(Players(confirm_players(opened)?)))
     }
 
     fn open_player_store(&self) -> Result<Box<dyn PlayerStore>> {
@@ -448,7 +445,7 @@ fn player_pids() -> Result<Vec<u32>> {
             .position(|&c| c == 0)
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-        if name.eq_ignore_ascii_case(PLAYER_EXE) {
+        if is_live_player(&name, entry.cntThreads) {
             pids.push(entry.th32ProcessID);
         }
         // SAFETY: as for Process32FirstW above.
@@ -458,19 +455,57 @@ fn player_pids() -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-/// What became of one Player process `close_process` was asked to close.
-#[derive(Debug, PartialEq, Eq)]
-enum Closed {
-    Terminated,
-    /// It exited on its own between the listing and the close.
-    AlreadyGone,
+/// A process list entry is a running Player: the Player's executable, with
+/// threads. A process with none has exited and only waits for its last
+/// handle to close, so there is nothing to close.
+fn is_live_player(exe: &str, threads: u32) -> bool {
+    exe.eq_ignore_ascii_case(PLAYER_EXE) && threads > 0
 }
 
-/// Terminates one Player process and waits for it to exit.
-///
-/// Terminated rather than asked to close: a Player that exits normally writes
-/// its cookie store first, and that write could land after the new session.
-fn close_process(pid: u32) -> Result<Closed> {
+/// One opened process, as far as closing it goes. A trait so the decisions in
+/// [`confirm_players`] and [`terminate_players`] can be tested on fakes.
+trait Process {
+    /// Whether it has exited already, without waiting.
+    fn has_exited(&self) -> bool;
+    /// The full path of the program it runs.
+    fn image(&self) -> std::io::Result<String>;
+    fn terminate(&self) -> std::io::Result<()>;
+    /// Waits up to 10 seconds; whether it exited.
+    fn wait_for_exit(&self) -> bool;
+}
+
+/// How long a terminated Player gets to exit.
+const EXIT_WAIT_MS: u32 = 10_000;
+
+impl Process for Handle {
+    fn has_exited(&self) -> bool {
+        // SAFETY: the handle is open, with PROCESS_SYNCHRONIZE, until its
+        // guard closes it; a zero timeout only polls.
+        unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+    }
+
+    fn image(&self) -> std::io::Result<String> {
+        image_path(self)
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        // SAFETY: the handle is open, with PROCESS_TERMINATE, until its guard
+        // closes it.
+        if unsafe { TerminateProcess(self.0, 1) } == TRUE {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn wait_for_exit(&self) -> bool {
+        // SAFETY: as in `has_exited`, with a bounded wait.
+        unsafe { WaitForSingleObject(self.0, EXIT_WAIT_MS) == WAIT_OBJECT_0 }
+    }
+}
+
+/// Opens a process with the rights closing it takes.
+fn open_process(pid: u32) -> std::io::Result<Handle> {
     // SAFETY: OpenProcess takes plain values and returns a handle or null; it
     // reads no memory of ours.
     let handle = unsafe {
@@ -481,55 +516,95 @@ fn close_process(pid: u32) -> Result<Closed> {
         )
     };
     if handle.is_null() {
-        return not_opened(pid, std::io::Error::last_os_error());
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(Handle(handle))
     }
-    let handle = Handle(handle);
+}
 
-    // The id was the Player's when the processes were listed. If the Player
-    // exited since, Windows may have handed the id to another process, which
-    // must not be terminated in its place.
-    match identify(pid, image_path(&handle))? {
-        Identity::Player => {}
-        Identity::Other(image) => {
-            println!(
+/// Every running Player, opened and confirmed, not yet closed. Holding the
+/// handles also keeps each process id from being given to another program
+/// until they are closed.
+struct Players(Vec<(u32, Handle)>);
+
+impl OpenPlayers for Players {
+    fn close(self: Box<Self>) -> Result<bool> {
+        terminate_players(&self.0)
+    }
+}
+
+/// Keeps the opened processes that are still the Player, and refuses the
+/// whole close, with nothing terminated, when one of them cannot be opened or
+/// identified.
+fn confirm_players<P: Process>(opened: Vec<(u32, std::io::Result<P>)>) -> Result<Vec<(u32, P)>> {
+    let mut players = Vec::new();
+    for (pid, process) in opened {
+        let process = match process {
+            Ok(process) => process,
+            Err(error) => {
+                not_opened(pid, error)?;
+                continue;
+            }
+        };
+        if process.has_exited() {
+            continue;
+        }
+        // The id was the Player's when the processes were listed. If the
+        // Player exited since, Windows may have handed the id to another
+        // process, which must not be terminated in its place.
+        match identify(pid, process.image())? {
+            Identity::Player => players.push((pid, process)),
+            Identity::Other(image) => println!(
                 "{}",
                 format!(
                     "Process {pid} is no longer the Roblox Player (it is now {image}); \
                      left running."
                 )
                 .dimmed()
-            );
-            return Ok(Closed::AlreadyGone);
+            ),
         }
     }
-
-    // SAFETY: `handle` is open, with the PROCESS_TERMINATE right, until the
-    // guard closes it when this function returns.
-    if unsafe { TerminateProcess(handle.0, 1) } != TRUE {
-        bail!(
-            "Could not close the Roblox Player (process {pid}): {}. Close it, then retry.",
-            std::io::Error::last_os_error()
-        );
-    }
-    // SAFETY: the same open handle, which carries PROCESS_SYNCHRONIZE.
-    if unsafe { WaitForSingleObject(handle.0, 10_000) } != WAIT_OBJECT_0 {
-        bail!(
-            "The Roblox Player (process {pid}) was told to close but had not exited \
-             10 seconds later. Close it, then retry."
-        );
-    }
-    Ok(Closed::Terminated)
+    Ok(players)
 }
 
-/// Why OpenProcess failed on a Player process, from the error it left.
+/// Terminates every confirmed Player, then waits for each to exit. `false`
+/// when every one had exited on its own.
+///
+/// Terminated rather than asked to close: a Player that exits normally writes
+/// its cookie store first, and that write could land after the new session.
+fn terminate_players<P: Process>(players: &[(u32, P)]) -> Result<bool> {
+    let mut terminated = false;
+    for (pid, process) in players {
+        match process.terminate() {
+            Ok(()) => terminated = true,
+            // TerminateProcess refuses a process that is already exiting.
+            Err(_) if process.has_exited() => {}
+            Err(error) => bail!(
+                "Could not close the Roblox Player (process {pid}): {error}. Close it, then retry."
+            ),
+        }
+    }
+    for (pid, process) in players {
+        if !process.wait_for_exit() {
+            bail!(
+                "The Roblox Player (process {pid}) was told to close but had not exited \
+                 10 seconds later. Close it, then retry."
+            );
+        }
+    }
+    Ok(terminated)
+}
+
+/// Why OpenProcess failed on a Player process, from the error it left. `Ok`
+/// when the Player is gone.
 ///
 /// Only a process id that no longer names a process means the Player is gone:
 /// OpenProcess answers that with ERROR_INVALID_PARAMETER. Any other failure,
 /// such as a Player running as administrator refusing an ordinary user, means
 /// it is still running, and the switch must not go on as if it were closed.
-fn not_opened(pid: u32, error: std::io::Error) -> Result<Closed> {
+fn not_opened(pid: u32, error: std::io::Error) -> Result<()> {
     if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-        return Ok(Closed::AlreadyGone);
+        return Ok(());
     }
     bail!(
         "Could not close the Roblox Player (process {pid}): Windows refused to open it \
@@ -1019,7 +1094,130 @@ mod tests {
     #[test]
     fn a_player_that_exited_before_the_close_counts_as_gone() {
         let error = std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
-        assert_eq!(not_opened(1234, error).unwrap(), Closed::AlreadyGone);
+        assert!(not_opened(1234, error).is_ok());
+    }
+
+    const PLAYER_IMAGE: &str = r"C:\Roblox\Versions\version-0\RobloxPlayerBeta.exe";
+
+    /// A process that only records what was done to it.
+    struct FakeProcess {
+        /// `None` when its image cannot be read.
+        image: Option<&'static str>,
+        exited: std::cell::Cell<bool>,
+        /// Whether TerminateProcess refuses it.
+        refuses_terminate: bool,
+        terminated: std::cell::Cell<bool>,
+    }
+
+    impl FakeProcess {
+        fn running(image: &'static str) -> Self {
+            Self {
+                image: Some(image),
+                exited: false.into(),
+                refuses_terminate: false,
+                terminated: false.into(),
+            }
+        }
+    }
+
+    impl Process for FakeProcess {
+        fn has_exited(&self) -> bool {
+            self.exited.get()
+        }
+        fn image(&self) -> std::io::Result<String> {
+            self.image
+                .map(String::from)
+                .ok_or_else(|| std::io::Error::from_raw_os_error(5))
+        }
+        fn terminate(&self) -> std::io::Result<()> {
+            if self.refuses_terminate {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            self.terminated.set(true);
+            self.exited.set(true);
+            Ok(())
+        }
+        fn wait_for_exit(&self) -> bool {
+            self.exited.get()
+        }
+    }
+
+    fn gone() -> std::io::Result<FakeProcess> {
+        Err(std::io::Error::from_raw_os_error(
+            ERROR_INVALID_PARAMETER as i32,
+        ))
+    }
+
+    #[test]
+    fn only_processes_still_the_player_are_kept() {
+        let exited = FakeProcess::running(PLAYER_IMAGE);
+        exited.exited.set(true);
+        let opened = vec![
+            (1, Ok(FakeProcess::running(PLAYER_IMAGE))),
+            (2, gone()),
+            (3, Ok(exited)),
+            (4, Ok(FakeProcess::running(r"C:\Windows\notepad.exe"))),
+        ];
+        let kept: Vec<u32> = confirm_players(opened)
+            .unwrap()
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect();
+        assert_eq!(kept, [1]);
+    }
+
+    #[test]
+    fn one_player_that_cannot_be_confirmed_refuses_the_whole_close() {
+        let refused = || Err(std::io::Error::from_raw_os_error(5));
+        let unreadable = FakeProcess {
+            image: None,
+            ..FakeProcess::running(PLAYER_IMAGE)
+        };
+        for second in [refused(), Ok(unreadable)] {
+            let opened = vec![(1, Ok(FakeProcess::running(PLAYER_IMAGE))), (2, second)];
+            let error = confirm_players(opened).err().unwrap().to_string();
+            assert!(error.contains("process 2"), "{error}");
+        }
+    }
+
+    #[test]
+    fn every_confirmed_player_is_terminated() {
+        let players = [
+            (1, FakeProcess::running(PLAYER_IMAGE)),
+            (2, FakeProcess::running(PLAYER_IMAGE)),
+        ];
+        assert!(terminate_players(&players).unwrap());
+        assert!(players.iter().all(|(_, p)| p.terminated.get()));
+    }
+
+    /// TerminateProcess refuses a process that is already exiting; that
+    /// one is gone, not a failure.
+    #[test]
+    fn a_player_that_exits_while_being_closed_is_gone() {
+        let exiting = FakeProcess {
+            refuses_terminate: true,
+            ..FakeProcess::running(PLAYER_IMAGE)
+        };
+        exiting.exited.set(true);
+        assert!(!terminate_players(&[(1, exiting)]).unwrap());
+    }
+
+    #[test]
+    fn a_player_that_refuses_to_close_and_keeps_running_is_an_error() {
+        let stubborn = FakeProcess {
+            refuses_terminate: true,
+            ..FakeProcess::running(PLAYER_IMAGE)
+        };
+        let error = terminate_players(&[(1, stubborn)]).unwrap_err().to_string();
+        assert!(error.contains("process 1"), "{error}");
+    }
+
+    #[test]
+    fn a_player_process_with_no_threads_is_not_running() {
+        assert!(is_live_player("RobloxPlayerBeta.exe", 12));
+        assert!(is_live_player("robloxplayerbeta.exe", 1));
+        assert!(!is_live_player("RobloxPlayerBeta.exe", 0));
+        assert!(!is_live_player("notepad.exe", 12));
     }
 
     /// The message Windows gives is localised, so only the process id and

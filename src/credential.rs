@@ -33,14 +33,24 @@ pub trait CredentialStore {
     /// Whether a Roblox Player process is running right now.
     fn player_running(&self) -> Result<bool>;
 
-    /// Close every running Roblox Player, game in progress included, and wait
-    /// for them to exit. `false` when none was running.
-    fn close_player(&self) -> Result<bool>;
+    /// Open every running Roblox Player and confirm each one is the Player,
+    /// closing none yet. Fails with nothing closed when one cannot be opened
+    /// or identified, so a close that would be refused is refused before a
+    /// ticket is spent.
+    fn open_players(&self) -> Result<Box<dyn OpenPlayers>>;
 
     /// Read the Player's cookie store and check it can take a session:
     /// present, decryptable, in the expected format and signed in. Changes
     /// nothing, so it runs before a ticket is spent or a Player closed.
     fn open_player_store(&self) -> Result<Box<dyn PlayerStore>>;
+}
+
+/// Every running Player, opened and confirmed by
+/// [`CredentialStore::open_players`].
+pub trait OpenPlayers {
+    /// Close them all, game in progress included, and wait for them to exit.
+    /// `false` when none was left to close.
+    fn close(self: Box<Self>) -> Result<bool>;
 }
 
 /// The Player's cookie store, read and checked by
