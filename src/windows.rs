@@ -10,7 +10,8 @@ use std::slice;
 
 use base64::Engine as _;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+    CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
@@ -215,31 +216,14 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn close_player(&self) -> Result<bool> {
-        let pids = player_pids()?;
-        for &pid in &pids {
-            // Terminated rather than asked to close: a Player that exits
-            // normally writes its cookie store first, and that write could
-            // land after the new session.
-            // SAFETY: OpenProcess takes plain values and returns a handle or
-            // null; it reads no memory of ours.
-            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
-            if handle.is_null() {
-                // Already gone between the listing and now.
-                continue;
-            }
-            let handle = Handle(handle);
-            // SAFETY: `handle` is open, with the PROCESS_TERMINATE right, until
-            // the guard closes it at the end of this iteration.
-            let terminated = unsafe { TerminateProcess(handle.0, 1) } == TRUE;
-            // SAFETY: the same open handle, which carries PROCESS_SYNCHRONIZE.
-            let exited = unsafe { WaitForSingleObject(handle.0, 10_000) } == WAIT_OBJECT_0;
-            if !terminated || !exited {
-                return Err(anyhow!(
-                    "Could not close the Roblox Player (process {pid}). Close it, then retry."
-                ));
+        let mut closed = false;
+        for pid in player_pids()? {
+            match close_process(pid)? {
+                Closed::Terminated => closed = true,
+                Closed::AlreadyGone => {}
             }
         }
-        Ok(!pids.is_empty())
+        Ok(closed)
     }
 
     fn write_player_session(&self, session: &Session) -> Result<()> {
@@ -345,6 +329,61 @@ fn player_pids() -> Result<Vec<u32>> {
     }
 
     Ok(pids)
+}
+
+/// What became of one Player process `close_process` was asked to close.
+#[derive(Debug, PartialEq, Eq)]
+enum Closed {
+    Terminated,
+    /// It exited on its own between the listing and the close.
+    AlreadyGone,
+}
+
+/// Terminates one Player process and waits for it to exit.
+///
+/// Terminated rather than asked to close: a Player that exits normally writes
+/// its cookie store first, and that write could land after the new session.
+fn close_process(pid: u32) -> Result<Closed> {
+    // SAFETY: OpenProcess takes plain values and returns a handle or null; it
+    // reads no memory of ours.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return not_opened(pid, std::io::Error::last_os_error());
+    }
+    let handle = Handle(handle);
+
+    // SAFETY: `handle` is open, with the PROCESS_TERMINATE right, until the
+    // guard closes it when this function returns.
+    if unsafe { TerminateProcess(handle.0, 1) } != TRUE {
+        bail!(
+            "Could not close the Roblox Player (process {pid}): {}. Close it, then retry.",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: the same open handle, which carries PROCESS_SYNCHRONIZE.
+    if unsafe { WaitForSingleObject(handle.0, 10_000) } != WAIT_OBJECT_0 {
+        bail!(
+            "The Roblox Player (process {pid}) was told to close but had not exited \
+             10 seconds later. Close it, then retry."
+        );
+    }
+    Ok(Closed::Terminated)
+}
+
+/// Why OpenProcess failed on a Player process, from the error it left.
+///
+/// Only a process id that no longer names a process means the Player is gone:
+/// OpenProcess answers that with ERROR_INVALID_PARAMETER. Any other failure,
+/// such as a Player running as administrator refusing an ordinary user, means
+/// it is still running, and the switch must not go on as if it were closed.
+fn not_opened(pid: u32, error: std::io::Error) -> Result<Closed> {
+    if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+        return Ok(Closed::AlreadyGone);
+    }
+    bail!(
+        "Could not close the Roblox Player (process {pid}): Windows refused to open it \
+         ({error}). Close it yourself, then retry."
+    )
 }
 
 /// A handle this module opened, closed on every path out.
@@ -519,6 +558,23 @@ mod tests {
             Some("https://example.com/a.png")
         );
         assert_eq!(accounts[1].profile_pic_url, None);
+    }
+
+    #[test]
+    fn a_player_that_exited_before_the_close_counts_as_gone() {
+        let error = std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
+        assert_eq!(not_opened(1234, error).unwrap(), Closed::AlreadyGone);
+    }
+
+    /// The message Windows gives is localised, so only the process id and
+    /// this tool's own words are checked.
+    #[test]
+    fn a_player_windows_refuses_to_open_is_not_closed() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let error = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+        let error = not_opened(1234, error).unwrap_err().to_string();
+        assert!(error.contains("process 1234"), "{error}");
+        assert!(error.contains("refused to open it"), "{error}");
     }
 
     #[test]

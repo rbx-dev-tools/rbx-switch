@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **`--force` no longer reports a Player it could not close as closed.** When Windows refuses to open the Player's process, for instance a Player running as administrator, the switch stops there with the reason, before anything is written. "Closed the Roblox Player" is printed only when a Player was actually closed.
 - **`--player` gives up on an unresponsive Roblox server** instead of waiting forever: 10 seconds to connect, 20 seconds for any one read, 30 seconds for a whole request.
 
 ## [0.4.0] - 2026-11-08
