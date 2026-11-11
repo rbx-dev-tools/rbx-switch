@@ -13,6 +13,7 @@ use std::slice;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use colored::Colorize as _;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE,
     WAIT_OBJECT_0,
@@ -28,7 +29,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 use crate::credential::{Account, CredentialStore, PlayerStore};
@@ -405,10 +407,11 @@ fn beside(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// The Roblox Player's executable.
+const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
+
 /// The process ids of every running Roblox Player.
 fn player_pids() -> Result<Vec<u32>> {
-    const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
-
     // SAFETY: plain values in, a handle or INVALID_HANDLE_VALUE out; it reads
     // no memory of ours.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -470,11 +473,35 @@ enum Closed {
 fn close_process(pid: u32) -> Result<Closed> {
     // SAFETY: OpenProcess takes plain values and returns a handle or null; it
     // reads no memory of ours.
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
     if handle.is_null() {
         return not_opened(pid, std::io::Error::last_os_error());
     }
     let handle = Handle(handle);
+
+    // The id was the Player's when the processes were listed. If the Player
+    // exited since, Windows may have handed the id to another process, which
+    // must not be terminated in its place.
+    match identify(pid, image_path(&handle))? {
+        Identity::Player => {}
+        Identity::Other(image) => {
+            println!(
+                "{}",
+                format!(
+                    "Process {pid} is no longer the Roblox Player (it is now {image}); \
+                     left running."
+                )
+                .dimmed()
+            );
+            return Ok(Closed::AlreadyGone);
+        }
+    }
 
     // SAFETY: `handle` is open, with the PROCESS_TERMINATE right, until the
     // guard closes it when this function returns.
@@ -508,6 +535,54 @@ fn not_opened(pid: u32, error: std::io::Error) -> Result<Closed> {
         "Could not close the Roblox Player (process {pid}): Windows refused to open it \
          ({error}). Close it yourself, then retry."
     )
+}
+
+/// Whose process an opened handle is, from its image path.
+#[derive(Debug, PartialEq, Eq)]
+enum Identity {
+    Player,
+    /// Another program, which took the id after the Player exited.
+    Other(String),
+}
+
+/// Decides from the image path of an opened process whether it is still
+/// the Player. A path that cannot be read proves nothing either way, so the
+/// switch stops rather than terminate an unknown process or go on with a
+/// Player that may still be open.
+fn identify(pid: u32, image: std::io::Result<String>) -> Result<Identity> {
+    let image = image.map_err(|error| {
+        anyhow!(
+            "Could not close the Roblox Player (process {pid}): Windows would not say \
+             which program it is ({error}). Close it yourself, then retry."
+        )
+    })?;
+    let name = Path::new(&image)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.eq_ignore_ascii_case(PLAYER_EXE) {
+        Ok(Identity::Player)
+    } else {
+        Ok(Identity::Other(image))
+    }
+}
+
+/// The full path of the program an opened process runs.
+fn image_path(process: &Handle) -> std::io::Result<String> {
+    let mut buffer = [0u16; 1024];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `process` is open with PROCESS_QUERY_LIMITED_INFORMATION until
+    // its guard closes it, `buffer` holds `len` writable u16s, and `len` is a
+    // valid place for the count Windows writes back.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+    };
+    if ok != TRUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // On success `len` is the number of characters written, without the NUL.
+    let written = buffer.get(..len as usize).unwrap_or(&buffer);
+    Ok(String::from_utf16_lossy(written))
 }
 
 /// A handle this module opened, closed on every path out.
@@ -928,6 +1003,37 @@ mod tests {
         let error = not_opened(1234, error).unwrap_err().to_string();
         assert!(error.contains("process 1234"), "{error}");
         assert!(error.contains("refused to open it"), "{error}");
+    }
+
+    #[test]
+    fn the_player_is_recognised_by_its_image_whatever_the_case() {
+        let image = r"C:\Program Files\Roblox\Versions\version-0\RobloxPlayerBeta.exe";
+        assert_eq!(identify(1234, Ok(image.into())).unwrap(), Identity::Player);
+        let lower = r"c:\roblox\robloxplayerbeta.EXE";
+        assert_eq!(identify(1234, Ok(lower.into())).unwrap(), Identity::Player);
+    }
+
+    /// An id the Player held, handed to another program after it exited.
+    #[test]
+    fn a_reused_process_id_is_another_program() {
+        let image = r"C:\Windows\System32\notepad.exe";
+        assert_eq!(
+            identify(1234, Ok(image.into())).unwrap(),
+            Identity::Other(image.into())
+        );
+        let lookalike = r"C:\x\RobloxPlayerBeta.exe.old";
+        assert!(matches!(
+            identify(1234, Ok(lookalike.into())).unwrap(),
+            Identity::Other(_)
+        ));
+    }
+
+    #[test]
+    fn a_process_whose_image_cannot_be_read_stops_the_switch() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let error = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+        let error = identify(1234, Err(error)).unwrap_err().to_string();
+        assert!(error.contains("process 1234"), "{error}");
     }
 
     #[test]
