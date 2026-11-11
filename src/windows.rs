@@ -686,9 +686,28 @@ fn open_process(pid: u32) -> std::io::Result<Handle> {
 struct Players(Vec<(u32, Handle)>);
 
 impl OpenPlayers for Players {
+    fn add_newcomers(&mut self) -> Result<()> {
+        let held: Vec<u32> = self.0.iter().map(|(pid, _)| *pid).collect();
+        let opened = newcomers(&held, player_pids()?)
+            .into_iter()
+            .map(|pid| (pid, open_process(pid)))
+            .collect();
+        self.0.extend(confirm_players(opened)?);
+        Ok(())
+    }
+
     fn close(self: Box<Self>) -> Result<bool> {
         terminate_players(&self.0)
     }
+}
+
+/// The listed process ids not already held. A held handle keeps its id from
+/// being reused, so a held id listed again is the same process.
+fn newcomers(held: &[u32], listed: Vec<u32>) -> Vec<u32> {
+    listed
+        .into_iter()
+        .filter(|pid| !held.contains(pid))
+        .collect()
 }
 
 /// Keeps the opened processes that are still the Player, and refuses the
@@ -730,27 +749,62 @@ fn confirm_players<P: Process>(opened: Vec<(u32, std::io::Result<P>)>) -> Result
 ///
 /// Terminated rather than asked to close: a Player that exits normally writes
 /// its cookie store first, and that write could land after the new session.
+///
+/// Each was opened with the rights this takes, so a refusal here is rare. If
+/// one still fails, the rest are left alone and the error names every process:
+/// the ones closed and the ones still open.
 fn terminate_players<P: Process>(players: &[(u32, P)]) -> Result<bool> {
     let mut terminated = false;
-    for (pid, process) in players {
+    for (index, (pid, process)) in players.iter().enumerate() {
         match process.terminate() {
             Ok(()) => terminated = true,
             // TerminateProcess refuses a process that is already exiting.
             Err(_) if process.has_exited() => {}
-            Err(error) => bail!(
-                "Could not close the Roblox Player (process {pid}): {error}. Close it, then retry."
-            ),
+            Err(error) => {
+                let (done, rest) = players.split_at(index);
+                bail!(partly_closed(
+                    &format!("process {pid} refused: {error}"),
+                    done.iter().map(|(pid, _)| *pid),
+                    rest.iter().map(|(pid, _)| *pid),
+                ));
+            }
         }
     }
     for (pid, process) in players {
         if !process.wait_for_exit() {
-            bail!(
-                "The Roblox Player (process {pid}) was told to close but had not exited \
-                 10 seconds later. Close it, then retry."
-            );
+            let exited = |p: &&(u32, P)| p.1.has_exited();
+            bail!(partly_closed(
+                &format!("process {pid} had not exited 10 seconds after being closed"),
+                players.iter().filter(exited).map(|(pid, _)| *pid),
+                players.iter().filter(|p| !exited(p)).map(|(pid, _)| *pid),
+            ));
         }
     }
     Ok(terminated)
+}
+
+/// The error for a close that stopped part way: which processes are closed,
+/// which are not, and that nothing was written.
+fn partly_closed(
+    why: &str,
+    closed: impl Iterator<Item = u32>,
+    open: impl Iterator<Item = u32>,
+) -> String {
+    let list = |pids: Vec<u32>| {
+        if pids.is_empty() {
+            "none".to_string()
+        } else {
+            let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+            format!("process {}", pids.join(", "))
+        }
+    };
+    format!(
+        "Could not close every Roblox Player ({why}). Closed: {}. Still open: {}. \
+         Nothing was written: the Player's cookie store and Studio are as they were. \
+         Close the rest, then retry.",
+        list(closed.collect()),
+        list(open.collect()),
+    )
 }
 
 /// Why OpenProcess failed on a Player process, from the error it left. `Ok`
@@ -1531,6 +1585,32 @@ mod tests {
         };
         let error = terminate_players(&[(1, stubborn)]).unwrap_err().to_string();
         assert!(error.contains("process 1"), "{error}");
+    }
+
+    #[test]
+    fn a_close_that_stops_part_way_names_what_was_closed_and_what_was_not() {
+        let stubborn = FakeProcess {
+            refuses_terminate: true,
+            ..FakeProcess::running(PLAYER_IMAGE)
+        };
+        let players = [
+            (11, FakeProcess::running(PLAYER_IMAGE)),
+            (22, stubborn),
+            (33, FakeProcess::running(PLAYER_IMAGE)),
+        ];
+
+        let error = terminate_players(&players).unwrap_err().to_string();
+
+        assert!(error.contains("Closed: process 11."), "{error}");
+        assert!(error.contains("Still open: process 22, 33."), "{error}");
+        assert!(error.contains("Nothing was written"), "{error}");
+        assert!(!players[2].1.terminated.get(), "the rest are left alone");
+    }
+
+    #[test]
+    fn only_players_started_since_the_first_listing_are_newcomers() {
+        assert_eq!(newcomers(&[11, 22], vec![22, 33, 11, 44]), [33, 44]);
+        assert!(newcomers(&[11], vec![11]).is_empty());
     }
 
     #[test]
