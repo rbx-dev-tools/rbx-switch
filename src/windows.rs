@@ -1,14 +1,16 @@
 // Windows credential store access requires unsafe FFI into the Win32
 // security API. Scoped to this module so the rest of the crate stays
-// under the workspace-wide `unsafe_code = "warn"` lint.
+// under the crate-wide `unsafe_code = "warn"` lint, and every block here
+// has to say why it is sound.
 #![allow(unsafe_code)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::slice;
 
 use base64::Engine as _;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+    CloseHandle, LocalFree, FILETIME, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Credentials::{
     CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
@@ -48,29 +50,37 @@ impl WindowsCredentialStore {
         let target_wide = to_wide(target);
         let mut p_credential: *mut CREDENTIALW = std::ptr::null_mut();
 
-        unsafe {
-            if CredReadW(
+        // SAFETY: `target_wide` is NUL-terminated and outlives the call, and
+        // `p_credential` is a valid place for the out pointer. Nothing is
+        // read through that pointer unless the call succeeds.
+        let read = unsafe {
+            CredReadW(
                 target_wide.as_ptr(),
                 CRED_TYPE_GENERIC,
                 0,
                 &mut p_credential,
-            ) != TRUE
-            {
-                return Err(anyhow!(
-                    "Failed to read credential: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-
-            let cred = &*p_credential;
-            let bytes =
-                slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
-            let value =
-                String::from_utf8(bytes.to_vec()).context("Credential value is not valid UTF-8")?;
-
-            CredFree(p_credential as *mut _);
-            Ok(value)
+            )
+        };
+        if read != TRUE {
+            return Err(anyhow!(
+                "Failed to read credential: {}",
+                std::io::Error::last_os_error()
+            ));
         }
+        if p_credential.is_null() {
+            bail!("Windows reported the credential {target} as read but returned none");
+        }
+        let credential = Credential(p_credential);
+
+        // SAFETY: the pointer is not null and points at the CREDENTIALW that
+        // CredReadW allocated, which stays valid until `credential` frees it
+        // at the end of this function, after the last use of `cred`.
+        let cred = unsafe { &*credential.0 };
+        // SAFETY: Windows documents `CredentialBlob` as pointing at
+        // `CredentialBlobSize` bytes inside the same allocation, alive as
+        // long as `cred`. `copy_blob` checks the pointer against the length.
+        let bytes = unsafe { copy_blob(cred.CredentialBlob, cred.CredentialBlobSize) }?;
+        String::from_utf8(bytes).context("Credential value is not valid UTF-8")
     }
 
     fn write_credential(target: &str, value: &str) -> Result<()> {
@@ -83,7 +93,11 @@ impl WindowsCredentialStore {
             Type: CRED_TYPE_GENERIC,
             TargetName: target_wide.as_ptr() as *mut _,
             Comment: std::ptr::null_mut(),
-            LastWritten: unsafe { std::mem::zeroed() },
+            // Ignored on write: Windows sets it.
+            LastWritten: FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
             CredentialBlobSize: value_bytes.len() as u32,
             CredentialBlob: value_bytes.as_ptr() as *mut _,
             Persist: CRED_PERSIST_LOCAL_MACHINE,
@@ -93,13 +107,16 @@ impl WindowsCredentialStore {
             UserName: username_wide.as_ptr() as *mut _,
         };
 
-        unsafe {
-            if CredWriteW(&cred, 0) != TRUE {
-                return Err(anyhow!(
-                    "Failed to write credential: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
+        // SAFETY: every pointer in `cred` points into `target_wide`,
+        // `value_bytes` or `username_wide`, all alive until this function
+        // returns, and the two strings are NUL-terminated. `CredentialBlobSize`
+        // is the length of `value_bytes`. CredWriteW only reads them, and
+        // copies what it keeps.
+        if unsafe { CredWriteW(&cred, 0) } != TRUE {
+            return Err(anyhow!(
+                "Failed to write credential: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         Ok(())
@@ -203,20 +220,23 @@ impl CredentialStore for WindowsCredentialStore {
             // Terminated rather than asked to close: a Player that exits
             // normally writes its cookie store first, and that write could
             // land after the new session.
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
-                if handle.is_null() {
-                    // Already gone between the listing and now.
-                    continue;
-                }
-                let terminated = TerminateProcess(handle, 1) == TRUE;
-                let exited = WaitForSingleObject(handle, 10_000) == WAIT_OBJECT_0;
-                CloseHandle(handle);
-                if !terminated || !exited {
-                    return Err(anyhow!(
-                        "Could not close the Roblox Player (process {pid}). Close it, then retry."
-                    ));
-                }
+            // SAFETY: OpenProcess takes plain values and returns a handle or
+            // null; it reads no memory of ours.
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                // Already gone between the listing and now.
+                continue;
+            }
+            let handle = Handle(handle);
+            // SAFETY: `handle` is open, with the PROCESS_TERMINATE right, until
+            // the guard closes it at the end of this iteration.
+            let terminated = unsafe { TerminateProcess(handle.0, 1) } == TRUE;
+            // SAFETY: the same open handle, which carries PROCESS_SYNCHRONIZE.
+            let exited = unsafe { WaitForSingleObject(handle.0, 10_000) } == WAIT_OBJECT_0;
+            if !terminated || !exited {
+                return Err(anyhow!(
+                    "Could not close the Roblox Player (process {pid}). Close it, then retry."
+                ));
             }
         }
         Ok(!pids.is_empty())
@@ -281,36 +301,105 @@ impl CredentialStore for WindowsCredentialStore {
 fn player_pids() -> Result<Vec<u32>> {
     const PLAYER_EXE: &str = "RobloxPlayerBeta.exe";
 
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(anyhow!(
-                "Could not list running processes: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-
-        let mut pids = Vec::new();
-        let mut more = Process32FirstW(snapshot, &mut entry) == TRUE;
-        while more {
-            let len = entry
-                .szExeFile
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            if name.eq_ignore_ascii_case(PLAYER_EXE) {
-                pids.push(entry.th32ProcessID);
-            }
-            more = Process32NextW(snapshot, &mut entry) == TRUE;
-        }
-
-        CloseHandle(snapshot);
-        Ok(pids)
+    // SAFETY: plain values in, a handle or INVALID_HANDLE_VALUE out; it reads
+    // no memory of ours.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(anyhow!(
+            "Could not list running processes: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    let snapshot = Handle(snapshot);
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        cntUsage: 0,
+        th32ProcessID: 0,
+        th32DefaultHeapID: 0,
+        th32ModuleID: 0,
+        cntThreads: 0,
+        th32ParentProcessID: 0,
+        pcPriClassBase: 0,
+        dwFlags: 0,
+        szExeFile: [0; 260],
+    };
+
+    let mut pids = Vec::new();
+    // SAFETY: `snapshot` is a live process snapshot until its guard closes
+    // it, and `entry` is a writable PROCESSENTRY32W whose `dwSize` is set, as
+    // the call requires.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) } == TRUE;
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        if name.eq_ignore_ascii_case(PLAYER_EXE) {
+            pids.push(entry.th32ProcessID);
+        }
+        // SAFETY: as for Process32FirstW above.
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) } == TRUE;
+    }
+
+    Ok(pids)
+}
+
+/// A handle this module opened, closed on every path out.
+struct Handle(HANDLE);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned open by Windows, is owned by this
+        // guard alone, and is closed here once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A credential CredReadW allocated, freed with CredFree on every path out,
+/// errors included.
+struct Credential(*mut CREDENTIALW);
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        // SAFETY: the pointer is the non-null one a successful CredReadW
+        // returned, owned by this guard alone, and freed here once.
+        unsafe { CredFree(self.0.cast()) };
+    }
+}
+
+/// A buffer DPAPI allocated with LocalAlloc, freed with LocalFree on every
+/// path out.
+struct LocalBuffer(*mut u8);
+
+impl Drop for LocalBuffer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer is one DPAPI allocated for its output,
+            // owned by this guard alone, and freed here once.
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+}
+
+/// Copies `len` bytes out of a buffer a Win32 call handed back, refusing a
+/// null pointer that claims to hold bytes.
+///
+/// # Safety
+///
+/// When `ptr` is not null, it must point at `len` readable bytes.
+unsafe fn copy_blob(ptr: *const u8, len: u32) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        bail!("Windows returned {len} bytes at a null address");
+    }
+    // SAFETY: `ptr` is not null, and the caller guarantees it points at
+    // `len` readable bytes.
+    Ok(unsafe { slice::from_raw_parts(ptr, len as usize) }.to_vec())
 }
 
 /// Runs DPAPI one way or the other, for the current Windows user. The two
@@ -318,7 +407,7 @@ fn player_pids() -> Result<Vec<u32>> {
 /// direction needs here.
 fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB {
-        cbData: data.len() as u32,
+        cbData: u32::try_from(data.len()).context("The Player's cookie store is too large")?,
         pbData: data.as_ptr() as *mut u8,
     };
     let mut output = CRYPT_INTEGER_BLOB {
@@ -326,8 +415,13 @@ fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>> {
         pbData: std::ptr::null_mut(),
     };
 
-    unsafe {
-        let ok = if protect {
+    // SAFETY: `input` points at `data`, `cbData` bytes that outlive the call
+    // and that DPAPI only reads. The description, entropy, reserved and
+    // prompt arguments are null, which both functions accept, and `output`
+    // is a valid place for the result. On success Windows fills `output`
+    // with a buffer it allocated, which the guard below frees.
+    let ok = unsafe {
+        if protect {
             CryptProtectData(
                 &input,
                 std::ptr::null(),
@@ -347,18 +441,20 @@ fn dpapi(data: &[u8], protect: bool) -> Result<Vec<u8>> {
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output,
             )
-        };
-        if ok != TRUE {
-            return Err(anyhow!(
-                "Windows could not {} the Player's cookie store: {}",
-                if protect { "encrypt" } else { "decrypt" },
-                std::io::Error::last_os_error()
-            ));
         }
-        let bytes = slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
-        LocalFree(output.pbData as _);
-        Ok(bytes)
+    };
+    if ok != TRUE {
+        return Err(anyhow!(
+            "Windows could not {} the Player's cookie store: {}",
+            if protect { "encrypt" } else { "decrypt" },
+            std::io::Error::last_os_error()
+        ));
     }
+    let buffer = LocalBuffer(output.pbData);
+    // SAFETY: on success `pbData` points at `cbData` bytes Windows allocated,
+    // alive until `buffer` frees them after this copy. `copy_blob` checks the
+    // pointer against the length.
+    unsafe { copy_blob(buffer.0, output.cbData) }
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -367,4 +463,66 @@ fn to_wide(s: &str) -> Vec<u16> {
     let mut wide: Vec<u16> = OsStr::new(s).encode_wide().collect();
     wide.push(0);
     wide
+}
+
+// Nothing below reads the real cookie store or Credential Manager, opens a
+// process or talks to Roblox: files live in temp directories, and the one
+// DPAPI test encrypts its own data.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_null_blob_that_claims_bytes_is_refused() {
+        // SAFETY: a null pointer is the case under test; it is never read.
+        let error = unsafe { copy_blob(std::ptr::null(), 4) }.unwrap_err();
+        assert!(error.to_string().contains("null"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_blob_is_empty_whatever_its_pointer() {
+        // SAFETY: a length of zero reads nothing.
+        assert!(unsafe { copy_blob(std::ptr::null(), 0) }
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_blob_is_copied_whole() {
+        let data = b"1234567890";
+        // SAFETY: `data` is 10 readable bytes.
+        let copied = unsafe { copy_blob(data.as_ptr(), 10) }.unwrap();
+        assert_eq!(copied, data);
+    }
+
+    #[test]
+    fn dpapi_reads_back_what_it_wrote() {
+        let sealed = dpapi(b"test cookies", true).unwrap();
+        assert_ne!(sealed, b"test cookies");
+        assert_eq!(dpapi(&sealed, false).unwrap(), b"test cookies");
+    }
+
+    #[test]
+    fn dpapi_refuses_data_it_did_not_write() {
+        assert!(dpapi(b"not encrypted", false).is_err());
+    }
+
+    #[test]
+    fn registry_entries_are_split_and_read() {
+        let users = r#"{"1234567890":{"username":"MainAccount","profilePicUrl":"https://example.com/a.png"}};{"9876543210":{"username":"DevAccount"}};"#;
+        let accounts = WindowsCredentialStore::parse_accounts_from_registry(users).unwrap();
+        let ids: Vec<_> = accounts.iter().map(|a| a.user_id.as_str()).collect();
+        assert_eq!(ids, ["1234567890", "9876543210"]);
+        assert_eq!(accounts[0].username, "MainAccount");
+        assert_eq!(
+            accounts[0].profile_pic_url.as_deref(),
+            Some("https://example.com/a.png")
+        );
+        assert_eq!(accounts[1].profile_pic_url, None);
+    }
+
+    #[test]
+    fn a_malformed_registry_entry_is_an_error() {
+        assert!(WindowsCredentialStore::parse_accounts_from_registry("{not json").is_err());
+    }
 }
