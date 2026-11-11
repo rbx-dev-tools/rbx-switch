@@ -48,7 +48,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
 ] }
-winreg = "0.55"
+winreg = "0.56"
 
 # Release profile tuned for a distributed CLI binary. Slower to compile, but
 # the binary is smaller and starts faster.
