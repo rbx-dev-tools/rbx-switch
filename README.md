@@ -90,7 +90,7 @@ rbx-account qa --studio --player     # both apps
 rbx-account --player                 # pick from a list
 ```
 
-Any account signed in to Studio can be switched to: the Player has no account list of its own here.
+Any account signed in to Studio can be switched to: the Player has no account list of its own here. The Player itself must be signed in, as any account: the switch replaces its session, and a signed-out Player has none to replace. Sign in to it once, close it, and every switch after that works.
 
 **Nothing opens.** Like a Studio switch, `--player` changes the account and launches nothing: the Player starts signed in as it next time you open it, and stays on it.
 
@@ -104,7 +104,7 @@ Windows only.
 
 On Windows, Studio lists signed-in accounts in the registry (`LoggedInUsersStore`) and keeps the active user id in Credential Manager (`RobloxStudioAuthuserid`). `rbx-account` rewrites the latter. On macOS the locations are known but unverified; contributions from someone with a Mac and Studio are welcome.
 
-For `--player`, it first reads and checks the Player's cookie store, so a store it could not write into refuses the switch before anything is sent or closed. It then reads the account's Studio session from Credential Manager and sends it to `auth.roblox.com` to get a single-use sign-in ticket, the one the website gets when you press Play. It redeems that ticket for a session of the Player's own, checks with `users.roblox.com` that the session is the account's, and writes it into the Player's cookie store (`%LOCALAPPDATA%\Roblox\LocalStorage\RobloxCookies.dat`, encrypted for your Windows user), changing nothing else in it. Sessions go to Roblox's own hosts over HTTPS, never through a redirect, and are never printed. These are the only network calls the tool makes, and only `--player` makes them.
+For `--player`, it reads the account's Studio session from Credential Manager, then reads and checks the Player's cookie store, so a store it could not write into refuses the switch before anything is sent or closed. It then sends the Studio session to `auth.roblox.com` to get a single-use sign-in ticket, the one the website gets when you press Play. It redeems that ticket for a session of the Player's own, checks with `users.roblox.com` that the session is the account's, and writes it into the Player's cookie store (`%LOCALAPPDATA%\Roblox\LocalStorage\RobloxCookies.dat`, encrypted for your Windows user), changing nothing else in it. Sessions go to Roblox's own hosts over HTTPS, never through a redirect, and are never printed. A request with no answer gives up after 30 seconds. These are the only network calls the tool makes, and only `--player` makes them.
 
 The store is replaced in one step, through a file beside it, and the store as it was before the switch is kept next to it as `RobloxCookies.dat.rbx-account.bak`. That backup is encrypted the same way and holds the Player's previous session, so treat it like the store itself; each switch replaces it. With the Player closed, copying it back over `RobloxCookies.dat` undoes the switch.
 
