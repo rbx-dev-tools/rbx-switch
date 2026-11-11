@@ -299,7 +299,7 @@ pub fn replace_session(store: &str, session: &Session) -> Result<String> {
         .split("; ")
         .map(|cookie| {
             let mut fields: Vec<&str> = cookie.split('\t').collect();
-            if fields.len() == 7 && fields[5] == SESSION_COOKIE {
+            if is_session_cookie(&fields) {
                 found = true;
                 fields[6] = &session.0;
                 fields.join("\t")
@@ -313,6 +313,20 @@ pub fn replace_session(store: &str, session: &Session) -> Result<String> {
         bail!("the Player is signed out, so it holds no session to replace");
     }
     Ok(cookies.join("; "))
+}
+
+/// Whether [`replace_session`] would find a session to replace in `store`.
+/// Asked before anything changes, so a signed-out Player is refused before a
+/// ticket is spent on it.
+pub fn holds_session(store: &str) -> bool {
+    store
+        .split("; ")
+        .any(|cookie| is_session_cookie(&cookie.split('\t').collect::<Vec<_>>()))
+}
+
+/// A cookie line's fields are the session's: seven of them, the sixth its name.
+fn is_session_cookie(fields: &[&str]) -> bool {
+    fields.len() == 7 && fields[5] == SESSION_COOKIE
 }
 
 #[cfg(test)]
@@ -457,6 +471,14 @@ mod tests {
         let signed_out = "#HttpOnly_.roblox.com\tTRUE\t/\tFALSE\t0\tGuestData\tUserID=-1";
         let error = replace_session(signed_out, &session()).unwrap_err();
         assert!(error.to_string().contains("signed out"), "{error}");
+        assert!(!holds_session(signed_out));
+    }
+
+    #[test]
+    fn a_signed_in_store_holds_a_session() {
+        assert!(holds_session(STORE));
+        let named_only = "x.com\tTRUE\t/\tFALSE\t0\tnote\t.ROBLOSECURITY";
+        assert!(!holds_session(named_only), "a value is not a name");
     }
 
     #[test]
