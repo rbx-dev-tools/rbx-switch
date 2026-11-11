@@ -18,7 +18,7 @@ use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 
 use crate::config::{Config, Source};
-use crate::credential::{Account, CredentialStore, PlayerStore};
+use crate::credential::{Account, CredentialStore, OpenPlayers, PlayerStore};
 
 /// Cross-cutting flags, kept in one `Args` group so they can be placed either
 /// before or after the subcommand: `rbx-account --no-color list` and
@@ -341,11 +341,12 @@ fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> R
 ///
 /// Everything that can fail without changing anything runs first: the
 /// Player check, the session lookup, reading and checking the Player's
-/// cookie store, then the ticket and its redeem. Only then does anything
-/// change: an open Player is closed with `--force`, the Player's store is
-/// written, and Studio is switched last. A refusal at any earlier step leaves
-/// both apps as they were, and a store that could not take the session costs
-/// no ticket and closes no Player.
+/// cookie store, with `--force` opening and identifying every open Player,
+/// then the ticket and its redeem. Only then does anything change: the open
+/// Players are closed, the Player's store is written, and Studio is switched
+/// last. A refusal at any earlier step leaves both apps as they were, and a
+/// store that could not take the session, or a Player that could not be
+/// closed, costs no ticket.
 fn switch_with(
     store: &dyn CredentialStore,
     account: &Account,
@@ -353,11 +354,13 @@ fn switch_with(
     exchange: Exchange<'_>,
 ) -> Result<()> {
     if targets.player {
-        let (player_store, session) = player_prepare(store, account, targets.force, exchange)?;
-        if targets.force && store.close_player()? {
-            println!("{}", "Closed the Roblox Player".yellow());
+        let prepared = player_prepare(store, account, targets.force, exchange)?;
+        if let Some(players) = prepared.players {
+            if players.close()? {
+                println!("{}", "Closed the Roblox Player".yellow());
+            }
         }
-        player_store.write_session(&session)?;
+        prepared.store.write_session(&prepared.session)?;
         println!(
             "{} {} ({}) {}",
             "Switched the Player to".green(),
@@ -385,14 +388,22 @@ fn switch_with(
     Ok(())
 }
 
-/// The Player's store, checked, and the session to write into it, both in
-/// hand before anything changes.
+/// What a Player switch has in hand before it changes anything.
+struct Prepared {
+    /// The Player's store, read and checked.
+    store: Box<dyn PlayerStore>,
+    /// With `--force`, every open Player, confirmed and not yet closed.
+    players: Option<Box<dyn OpenPlayers>>,
+    /// The Player's new session.
+    session: player::Session,
+}
+
 fn player_prepare(
     store: &dyn CredentialStore,
     account: &Account,
     force: bool,
     exchange: Exchange<'_>,
-) -> Result<(Box<dyn PlayerStore>, player::Session)> {
+) -> Result<Prepared> {
     store.ensure_player_installed()?;
 
     // An open Player writes its cookie store back when it exits, over
@@ -416,8 +427,19 @@ fn player_prepare(
     // Before the ticket: a store that is missing, unreadable or signed out
     // refuses here, with no ticket spent and no Player closed.
     let player_store = store.open_player_store()?;
+    // Also before the ticket: a Player that could not be closed refuses here,
+    // rather than after a session was minted for nothing.
+    let players = if force {
+        Some(store.open_players()?)
+    } else {
+        None
+    };
     let player_session = exchange(&session, account)?;
-    Ok((player_store, player_session))
+    Ok(Prepared {
+        store: player_store,
+        players,
+        session: player_session,
+    })
 }
 
 /// The real [`Exchange`]: a ticket from the Studio session, redeemed for a
@@ -654,13 +676,22 @@ mod tests {
             self.steps.take("player_running")?;
             Ok(self.player_running)
         }
-        fn close_player(&self) -> Result<bool> {
-            self.steps.take("close_player")?;
-            Ok(self.player_running)
+        fn open_players(&self) -> Result<Box<dyn OpenPlayers>> {
+            self.steps.take("open_players")?;
+            Ok(Box::new(FakePlayers(self.steps.clone())))
         }
         fn open_player_store(&self) -> Result<Box<dyn PlayerStore>> {
             self.steps.take("open_player_store")?;
             Ok(Box::new(FakePlayerStore(self.steps.clone())))
+        }
+    }
+
+    struct FakePlayers(Steps);
+
+    impl OpenPlayers for FakePlayers {
+        fn close(self: Box<Self>) -> Result<bool> {
+            self.0.take("close_players")?;
+            Ok(true)
         }
     }
 
@@ -711,12 +742,21 @@ mod tests {
                 "ensure_player_installed",
                 "session",
                 "open_player_store",
+                "open_players",
                 "exchange",
-                "close_player",
+                "close_players",
                 "write_session",
                 "set_user_id",
             ]
         );
+    }
+
+    #[test]
+    fn a_player_that_cannot_be_closed_spends_no_ticket() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("open_players"));
+        assert!(result.is_err());
+        assert_eq!(steps.last(), Some(&"open_players"));
+        assert!(!steps.contains(&"exchange"), "{steps:?}");
     }
 
     #[test]
