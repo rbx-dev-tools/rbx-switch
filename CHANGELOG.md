@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`--player` keeps a backup of the Player's cookie store**, as `RobloxCookies.dat.rbx-account.bak` beside it: the store as it was before the latest switch. With the Player closed, copying it back over `RobloxCookies.dat` undoes that switch.
+
 ### Changed
 
 - **`--player` no longer opens the Player.** Like a Studio switch, it changes the account and launches nothing: the closed Player starts signed in as the account next time. The sign-in ticket is redeemed by `rbx-account` itself, for a session of the Player's own, and written into the Player's cookie store; nothing else in the store changes.
@@ -9,6 +13,7 @@
 
 ### Fixed
 
+- **`--player` keeps every key of the Player's cookie store file**, the ones it does not use included, instead of dropping them. The new store is flushed to disk before it replaces the old one.
 - **`--force` no longer reports a Player it could not close as closed.** When Windows refuses to open the Player's process, for instance a Player running as administrator, the switch stops there with the reason, before anything is written. "Closed the Roblox Player" is printed only when a Player was actually closed.
 - **`--player` gives up on an unresponsive Roblox server** instead of waiting forever: 10 seconds to connect, 20 seconds for any one read, 30 seconds for a whole request.
 
