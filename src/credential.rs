@@ -37,7 +37,16 @@ pub trait CredentialStore {
     /// for them to exit. `false` when none was running.
     fn close_player(&self) -> Result<bool>;
 
-    /// Put `session` in the closed Player's cookie store, so it opens signed
-    /// in with it next time.
-    fn write_player_session(&self, session: &Session) -> Result<()>;
+    /// Read the Player's cookie store and check it can take a session:
+    /// present, decryptable, in the expected format and signed in. Changes
+    /// nothing, so it runs before a ticket is spent or a Player closed.
+    fn open_player_store(&self) -> Result<Box<dyn PlayerStore>>;
+}
+
+/// The Player's cookie store, read and checked by
+/// [`CredentialStore::open_player_store`].
+pub trait PlayerStore {
+    /// Put `session` in the closed Player's store, so it opens signed in with
+    /// it next time.
+    fn write_session(self: Box<Self>, session: &Session) -> Result<()>;
 }

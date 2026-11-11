@@ -18,7 +18,7 @@ use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
 
 use crate::config::{Config, Source};
-use crate::credential::{Account, CredentialStore};
+use crate::credential::{Account, CredentialStore, PlayerStore};
 
 /// Cross-cutting flags, kept in one `Args` group so they can be placed either
 /// before or after the subcommand: `rbx-account --no-color list` and
@@ -328,21 +328,36 @@ fn stays_on(targets: Targets) -> &'static str {
     }
 }
 
+/// Trades an account's Studio session for a Player session of its own. A
+/// parameter of [`switch_with`], so the order of a switch can be tested
+/// without a network.
+type Exchange<'a> = &'a dyn Fn(&player::Session, &Account) -> Result<player::Session>;
+
+fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> Result<()> {
+    switch_with(store, account, targets, &exchange_session)
+}
+
 /// Applies one switch to every target.
 ///
 /// Everything that can fail without changing anything runs first: the
-/// Player check, the session lookup, the ticket and its redeem. Then the
-/// Player's switch, the step most likely to fail, and Studio's last, so a
-/// refusal leaves both apps as they were rather than Studio switched and the
-/// Player not. With `--force`, the Player is closed only once its new session
-/// is in hand, so a refused ticket closes nothing.
-fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> Result<()> {
+/// Player check, the session lookup, reading and checking the Player's
+/// cookie store, then the ticket and its redeem. Only then does anything
+/// change: an open Player is closed with `--force`, the Player's store is
+/// written, and Studio is switched last. A refusal at any earlier step leaves
+/// both apps as they were, and a store that could not take the session costs
+/// no ticket and closes no Player.
+fn switch_with(
+    store: &dyn CredentialStore,
+    account: &Account,
+    targets: Targets,
+    exchange: Exchange<'_>,
+) -> Result<()> {
     if targets.player {
-        let session = player_prepare(store, account, targets.force)?;
+        let (player_store, session) = player_prepare(store, account, targets.force, exchange)?;
         if targets.force && store.close_player()? {
             println!("{}", "Closed the Roblox Player".yellow());
         }
-        store.write_player_session(&session)?;
+        player_store.write_session(&session)?;
         println!(
             "{} {} ({}) {}",
             "Switched the Player to".green(),
@@ -370,12 +385,14 @@ fn switch(store: &dyn CredentialStore, account: &Account, targets: Targets) -> R
     Ok(())
 }
 
-/// The session a Player switch writes, fetched before anything changes.
+/// The Player's store, checked, and the session to write into it, both in
+/// hand before anything changes.
 fn player_prepare(
     store: &dyn CredentialStore,
     account: &Account,
     force: bool,
-) -> Result<player::Session> {
+    exchange: Exchange<'_>,
+) -> Result<(Box<dyn PlayerStore>, player::Session)> {
     store.ensure_player_installed()?;
 
     // An open Player writes its cookie store back when it exits, over
@@ -396,8 +413,19 @@ fn player_prepare(
         )
     })?;
 
+    // Before the ticket: a store that is missing, unreadable or signed out
+    // refuses here, with no ticket spent and no Player closed.
+    let player_store = store.open_player_store()?;
+    let player_session = exchange(&session, account)?;
+    Ok((player_store, player_session))
+}
+
+/// The real [`Exchange`]: a ticket from the Studio session, redeemed for a
+/// Player session, checked to be the account's.
+fn exchange_session(session: &player::Session, account: &Account) -> Result<player::Session> {
+    let who = &account.username;
     let transport = player::HttpTransport::new();
-    let ticket = player::request_ticket(&transport, &session, who)?;
+    let ticket = player::request_ticket(&transport, session, who)?;
     let player_session = player::redeem_ticket(&transport, &ticket)?;
     let owner = transport.user_id(&player_session)?;
     if owner != account.user_id {
@@ -516,6 +544,8 @@ fn resolve_account(accounts: &[Account], config: &Config, name: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn account(user_id: &str, username: &str) -> Account {
         Account {
@@ -578,6 +608,151 @@ mod tests {
             error.to_string().contains("No account found matching"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Records every step a switch takes, and fails the one named.
+    #[derive(Clone, Default)]
+    struct Steps {
+        taken: Rc<RefCell<Vec<&'static str>>>,
+        failing: Option<&'static str>,
+    }
+
+    impl Steps {
+        fn take(&self, step: &'static str) -> Result<()> {
+            self.taken.borrow_mut().push(step);
+            if self.failing == Some(step) {
+                bail!("{step} failed");
+            }
+            Ok(())
+        }
+    }
+
+    /// A credential store that touches nothing, for the order of a switch.
+    struct Fake {
+        steps: Steps,
+        player_running: bool,
+    }
+
+    impl CredentialStore for Fake {
+        fn list_accounts(&self) -> Result<Vec<Account>> {
+            Ok(accounts())
+        }
+        fn current_user_id(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn set_user_id(&self, _: &str) -> Result<()> {
+            self.steps.take("set_user_id")
+        }
+        fn session(&self, _: &str) -> Result<Option<player::Session>> {
+            self.steps.take("session")?;
+            Ok(player::Session::parse("_|WARNING:-studio-session"))
+        }
+        fn ensure_player_installed(&self) -> Result<()> {
+            self.steps.take("ensure_player_installed")
+        }
+        fn player_running(&self) -> Result<bool> {
+            self.steps.take("player_running")?;
+            Ok(self.player_running)
+        }
+        fn close_player(&self) -> Result<bool> {
+            self.steps.take("close_player")?;
+            Ok(self.player_running)
+        }
+        fn open_player_store(&self) -> Result<Box<dyn PlayerStore>> {
+            self.steps.take("open_player_store")?;
+            Ok(Box::new(FakePlayerStore(self.steps.clone())))
+        }
+    }
+
+    struct FakePlayerStore(Steps);
+
+    impl PlayerStore for FakePlayerStore {
+        fn write_session(self: Box<Self>, _: &player::Session) -> Result<()> {
+            self.0.take("write_session")
+        }
+    }
+
+    /// Switches to the first account with `targets`, the Player open, and
+    /// `failing` failing. Returns the outcome and every step taken.
+    fn switch_fake(
+        targets: Targets,
+        failing: Option<&'static str>,
+    ) -> (Result<()>, Vec<&'static str>) {
+        let steps = Steps {
+            failing,
+            ..Steps::default()
+        };
+        let store = Fake {
+            steps: steps.clone(),
+            player_running: true,
+        };
+        let exchange = |_: &player::Session, _: &Account| {
+            steps.take("exchange")?;
+            Ok(player::Session::parse("_|WARNING:-player-session").unwrap())
+        };
+        let result = switch_with(&store, &accounts()[0], targets, &exchange);
+        let taken = steps.taken.borrow().clone();
+        (result, taken)
+    }
+
+    const BOTH_FORCED: Targets = Targets {
+        studio: true,
+        player: true,
+        force: true,
+    };
+
+    #[test]
+    fn a_switch_checks_everything_before_it_changes_anything() {
+        let (result, steps) = switch_fake(BOTH_FORCED, None);
+        result.unwrap();
+        assert_eq!(
+            steps,
+            [
+                "ensure_player_installed",
+                "session",
+                "open_player_store",
+                "exchange",
+                "close_player",
+                "write_session",
+                "set_user_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_take_the_session_spends_no_ticket_and_closes_nothing() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("open_player_store"));
+        assert!(result.is_err());
+        assert_eq!(
+            steps,
+            ["ensure_player_installed", "session", "open_player_store"]
+        );
+    }
+
+    #[test]
+    fn a_refused_ticket_closes_nothing() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("exchange"));
+        assert!(result.is_err());
+        assert_eq!(steps.last(), Some(&"exchange"));
+    }
+
+    #[test]
+    fn a_store_write_that_fails_leaves_studio_alone() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("write_session"));
+        assert!(result.is_err());
+        assert!(!steps.contains(&"set_user_id"), "{steps:?}");
+    }
+
+    #[test]
+    fn an_open_player_without_force_is_refused_first() {
+        let targets = Targets {
+            player: true,
+            ..Targets::default()
+        };
+        let (result, steps) = switch_fake(targets, None);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("--force"), "{error}");
+        assert_eq!(steps, ["ensure_player_installed", "player_running"]);
     }
 
     #[test]
