@@ -12,7 +12,7 @@ mod windows;
 #[cfg(target_os = "macos")]
 mod macos;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Select};
@@ -438,6 +438,17 @@ fn player_prepare(
     // written stops the switch with nothing changed.
     player_store.back_up()?;
     let player_session = exchange(&session, account)?;
+
+    // A Player started during the exchange would write its store back over
+    // the switch, so it is confirmed now and closed with the others; if it
+    // cannot be, nothing has been closed yet.
+    let mut players = players;
+    if let Some(players) = &mut players {
+        players.add_newcomers().context(
+            "A Player was opened during the switch and cannot be closed. Nothing was \
+             closed or written, and the new Player session was discarded",
+        )?;
+    }
     Ok(Prepared {
         store: player_store,
         players,
@@ -692,6 +703,10 @@ mod tests {
     struct FakePlayers(Steps);
 
     impl OpenPlayers for FakePlayers {
+        fn add_newcomers(&mut self) -> Result<()> {
+            self.0.take("add_newcomers")
+        }
+
         fn close(self: Box<Self>) -> Result<bool> {
             self.0.take("close_players")?;
             Ok(true)
@@ -752,6 +767,7 @@ mod tests {
                 "open_players",
                 "back_up",
                 "exchange",
+                "add_newcomers",
                 "close_players",
                 "write_session",
                 "set_user_id",
@@ -765,6 +781,15 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(steps.last(), Some(&"back_up"));
         assert!(!steps.contains(&"exchange"), "{steps:?}");
+    }
+
+    #[test]
+    fn a_player_opened_during_the_exchange_that_cannot_be_closed_closes_nothing() {
+        let (result, steps) = switch_fake(BOTH_FORCED, Some("add_newcomers"));
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("discarded"), "{error}");
+        assert_eq!(steps.last(), Some(&"add_newcomers"));
+        assert!(!steps.contains(&"close_players"), "{steps:?}");
     }
 
     #[test]
