@@ -18,6 +18,7 @@
 //! redirect, and are never printed.
 
 use std::fmt;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -112,6 +113,13 @@ pub struct HttpTransport {
     agent: ureq::Agent,
 }
 
+/// How long a connection may take to open, TLS handshake included.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one read may wait for a byte, headers and body alike.
+const READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// The most one request may take from start to finish.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl HttpTransport {
     pub fn new() -> Self {
         let agent = ureq::Agent::config_builder()
@@ -121,6 +129,11 @@ impl HttpTransport {
             // redirect is followed, and nothing is sent over plain HTTP.
             .max_redirects(0)
             .https_only(true)
+            // Without these, a host that accepts the connection and never
+            // answers hangs the switch for good, with no message.
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_per_read(Some(READ_TIMEOUT))
+            .timeout_per_call(Some(CALL_TIMEOUT))
             .user_agent(concat!("rbx-account/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
@@ -465,6 +478,17 @@ mod tests {
         assert!(session_from_set_cookie(".ROBLOSECURITYX=_|WARNING:-x").is_none());
         // Roblox clears the cookie this way on sign-out: not a session.
         assert!(session_from_set_cookie(".ROBLOSECURITY=; expires=Thu, 01 Jan 1970").is_none());
+    }
+
+    /// Built without sending anything: the agent connects only on a request.
+    #[test]
+    fn every_request_gives_up_instead_of_hanging() {
+        let transport = HttpTransport::new();
+        let config = transport.agent.config();
+        let timeouts = config.timeouts();
+        assert_eq!(timeouts.connect, Some(CONNECT_TIMEOUT));
+        assert_eq!(config.timeout_per_read(), Some(READ_TIMEOUT));
+        assert_eq!(timeouts.per_call, Some(CALL_TIMEOUT));
     }
 
     struct Redeems(RefCell<Vec<RedeemResponse>>);
