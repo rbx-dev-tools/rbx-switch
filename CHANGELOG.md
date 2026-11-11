@@ -16,6 +16,7 @@
 - **`--player` checks the Player's cookie store before anything changes.** A store that is missing, cannot be decrypted, is not in the expected format or is signed out is refused before a sign-in ticket is requested and before `--force` closes the Player.
 - **`--player` keeps every key of the Player's cookie store file**, the ones it does not use included, instead of dropping them. The new store is flushed to disk before it replaces the old one.
 - **`--force` no longer reports a Player it could not close as closed.** When Windows refuses to open the Player's process, for instance a Player running as administrator, the switch stops there with the reason, before anything is written. "Closed the Roblox Player" is printed only when a Player was actually closed.
+- **`--force` closes only the Roblox Player.** Before terminating a process, it checks that the process still runs `RobloxPlayerBeta.exe`: one that took the id of a Player that exited is left running, and named.
 - **`--player` gives up on an unresponsive Roblox server** instead of waiting forever: 10 seconds to connect, 20 seconds for any one read, 30 seconds for a whole request.
 
 ## [0.4.0] - 2026-11-08
