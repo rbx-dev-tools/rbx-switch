@@ -333,13 +333,34 @@ impl OpenStore {
 
         // Read again: the store was checked before the ticket was fetched and
         // the Player closed, and a Player may have rewritten it since. The
-        // store on disk now is the one that takes the session.
-        let current = fs::read_to_string(&access.path)
-            .with_context(|| format!("Could not read {}", access.path.display()))?;
-        let (file, cookies) = if current == raw {
-            (file, cookies)
-        } else {
-            parse_store(&access, &current)?
+        // store on disk now is the one that takes the session, unless it can
+        // no longer be read: a Player killed while writing it can leave it
+        // torn. The copy checked before is then the one written, rather than
+        // the switch failing with the Player closed and the store broken.
+        let reread = fs::read_to_string(&access.path)
+            .with_context(|| format!("Could not read {}", access.path.display()))
+            .and_then(|current| {
+                if current == raw {
+                    Ok(None)
+                } else {
+                    parse_store(&access, &current).map(Some)
+                }
+            });
+        let (file, cookies) = match reread {
+            Ok(None) => (file, cookies),
+            Ok(Some(newer)) => newer,
+            Err(error) => {
+                println!(
+                    "{}",
+                    format!(
+                        "The Player's cookie store changed during the switch and can no \
+                         longer be read ({error:#}). The session goes into the store as \
+                         it was checked."
+                    )
+                    .dimmed()
+                );
+                (file, cookies)
+            }
         };
 
         let cookies = crate::player::replace_session(&cookies, session).context(SIGN_IN_ONCE)?;
@@ -1098,6 +1119,28 @@ mod tests {
             before,
             "the backup is the store as checked"
         );
+    }
+
+    /// A Player killed while writing its store can leave it torn: the copy
+    /// checked before is written instead of failing with the Player closed.
+    #[test]
+    fn a_store_torn_after_the_check_is_written_from_the_checked_copy() {
+        let before = store_json(COOKIES, fake_seal, r#","Kept":1"#);
+        let (_dir, access) = fake_store(&before, player_closed);
+        let path = access.path.clone();
+        let store = OpenStore::open(access).unwrap();
+
+        fs::write(&path, r#"{"CookiesVersion":"1","Cook"#).unwrap();
+        store.write(&new_session()).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["Kept"], 1);
+        let data = BASE64
+            .decode(after["CookiesData"].as_str().unwrap())
+            .unwrap();
+        let cookies = String::from_utf8(fake_unseal(&data).unwrap()).unwrap();
+        assert!(cookies.contains("\t.ROBLOSECURITY\t_|WARNING:-new-session"));
     }
 
     #[test]
