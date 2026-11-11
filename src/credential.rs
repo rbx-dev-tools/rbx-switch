@@ -48,6 +48,12 @@ pub trait CredentialStore {
 /// Every running Player, opened and confirmed by
 /// [`CredentialStore::open_players`].
 pub trait OpenPlayers {
+    /// Open and confirm, the same way, any Player started since. Called just
+    /// before the close, so a Player opened during the ticket exchange is
+    /// closed too rather than left to write its store over the switch. Fails
+    /// with nothing closed when a newcomer cannot be opened or identified.
+    fn add_newcomers(&mut self) -> Result<()>;
+
     /// Close them all, game in progress included, and wait for them to exit.
     /// `false` when none was left to close.
     fn close(self: Box<Self>) -> Result<bool>;
