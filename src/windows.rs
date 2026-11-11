@@ -6,6 +6,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -295,6 +296,41 @@ struct OpenStore {
     raw: String,
     file: StoreFile,
     cookies: String,
+    /// The new backup, written by `back_up` and renamed over the old one
+    /// only when the store is written. Removed if the switch stops first.
+    backup: RefCell<Option<PendingFile>>,
+}
+
+/// A temp file written ahead of time, removed unless it is renamed into
+/// place.
+struct PendingFile {
+    path: Option<PathBuf>,
+}
+
+impl PendingFile {
+    /// Writes `contents` to a fresh temp file beside `store`.
+    fn write(store: &Path, contents: &[u8]) -> std::io::Result<Self> {
+        let path = temp_beside(store);
+        write_new_synced(&path, contents)?;
+        Ok(Self { path: Some(path) })
+    }
+
+    /// Renames the file over `target`. On failure it is removed, by drop.
+    fn rename_to(mut self, target: &Path) -> std::io::Result<()> {
+        let path = self.path.take().unwrap_or_default();
+        fs::rename(&path, target).inspect_err(|_| {
+            self.path = Some(path.clone());
+        })
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            // Best effort: what is left is swept at the next switch.
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 impl OpenStore {
@@ -312,16 +348,19 @@ impl OpenStore {
             raw,
             file,
             cookies,
+            backup: RefCell::new(None),
         })
     }
 
-    /// Keeps the store as it was read beside it, replacing the backup of the
-    /// switch before. One deep: it holds the store as it was before the
-    /// latest switch.
+    /// Writes the store as it was read to a temp file beside it, ready to
+    /// replace the previous backup when the store is written. Nothing else
+    /// changes yet: a switch that stops before the write keeps the previous
+    /// backup, and the temp file is removed.
     fn back_up(&self) -> Result<()> {
-        let backup = beside(&self.access.path, BACKUP_SUFFIX);
-        replace_synced(&backup, self.raw.as_bytes())
-            .with_context(|| format!("Could not keep a backup at {}", backup.display()))
+        let pending = PendingFile::write(&self.access.path, self.raw.as_bytes())
+            .context("Could not keep a backup of the Player's cookie store")?;
+        *self.backup.borrow_mut() = Some(pending);
+        Ok(())
     }
 
     /// Puts `session` in the store, every other cookie and key kept.
@@ -331,7 +370,9 @@ impl OpenStore {
             raw,
             file,
             cookies,
+            backup,
         } = self;
+        let mut backup = backup.into_inner();
 
         // Read again: the store was checked before the ticket was fetched and
         // the Player closed, and a Player may have rewritten it since. The
@@ -339,15 +380,13 @@ impl OpenStore {
         // no longer be read: a Player killed while writing it can leave it
         // torn. The copy checked before is then the one written, rather than
         // the switch failing with the Player closed and the store broken.
-        let reread = fs::read_to_string(&access.path)
-            .with_context(|| format!("Could not read {}", access.path.display()))
-            .and_then(|current| {
-                if current == raw {
-                    Ok(None)
-                } else {
-                    parse_store(&access, &current).map(Some)
-                }
-            });
+        let current = fs::read_to_string(&access.path)
+            .with_context(|| format!("Could not read {}", access.path.display()));
+        let reread = match &current {
+            Ok(current) if *current == raw => Ok(None),
+            Ok(current) => parse_store(&access, current).map(Some),
+            Err(error) => Err(anyhow!("{error:#}")),
+        };
         let (file, cookies) = match reread {
             Ok(None) => (file, cookies),
             Ok(Some(newer)) => newer,
@@ -376,6 +415,22 @@ impl OpenStore {
         // check would write its own store back over this one when it exits.
         if (access.player_open)()? {
             bail!("The Roblox Player was opened during the switch. Close it, then retry.");
+        }
+
+        if let Some(pending) = backup.take() {
+            // The backup holds the bytes this write replaces: when the store
+            // changed since it was read, the newer content.
+            let pending = match &current {
+                Ok(current) if *current != raw => {
+                    PendingFile::write(&access.path, current.as_bytes())
+                        .context("Could not keep a backup of the Player's cookie store")?
+                }
+                _ => pending,
+            };
+            let target = beside(&access.path, BACKUP_SUFFIX);
+            pending
+                .rename_to(&target)
+                .with_context(|| format!("Could not keep a backup at {}", target.display()))?;
         }
 
         // Through a temp file renamed over the store, so an interrupted write
@@ -430,9 +485,11 @@ fn temp_beside(path: &Path) -> PathBuf {
     )
 }
 
-/// How old a temp file must be before it counts as left by a run that died:
-/// a live run writes and renames its own within milliseconds.
-const STRAY_AFTER: Duration = Duration::from_secs(60);
+/// How old a temp file must be before it counts as left by a run that died.
+/// A live run's backup waits through the ticket exchange (three requests of
+/// up to 30 seconds) and the close of every Player (10 seconds each), so the
+/// bound sits well above that.
+const STRAY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// Removes the temp files a run that died left beside the store. Each holds
 /// a whole encrypted session, so none is left lying around. Only files named
@@ -1073,17 +1130,59 @@ mod tests {
     }
 
     #[test]
-    fn a_backup_that_cannot_be_written_is_an_error_and_changes_nothing() {
+    fn a_backup_that_cannot_be_put_in_place_leaves_the_store_alone() {
         let before = store_json(COOKIES, fake_seal, "");
         let (dir, access) = fake_store(&before, player_closed);
         let path = access.path.clone();
         // A directory where the backup goes: the rename cannot replace it.
         fs::create_dir(dir.path().join("RobloxCookies.dat.rbx-account.bak")).unwrap();
 
-        let error = OpenStore::open(access).unwrap().back_up().unwrap_err();
+        let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
+        let error = store.write(&new_session()).unwrap_err();
 
         assert!(error.to_string().contains("backup"), "{error}");
         assert_eq!(fs::read_to_string(path).unwrap(), before);
+        assert!(no_temp_files(dir.path()));
+    }
+
+    fn no_temp_files(dir: &Path) -> bool {
+        files_in(dir).iter().all(|name| !name.ends_with(".tmp"))
+    }
+
+    /// The new backup replaces the previous one only when the store is
+    /// written: a switch that stops before keeps the previous backup.
+    #[test]
+    fn a_switch_that_stops_keeps_the_previous_backup() {
+        let (dir, access) = fake_store(&store_json(COOKIES, fake_seal, ""), player_closed);
+        let backup = dir.path().join("RobloxCookies.dat.rbx-account.bak");
+        fs::write(&backup, "previous backup").unwrap();
+
+        let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
+        drop(store);
+
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+        assert!(no_temp_files(dir.path()), "{:?}", files_in(dir.path()));
+    }
+
+    /// Every temp file, the backup's included, is named after the store, so
+    /// the sweep's one pattern covers them all.
+    #[test]
+    fn the_pending_backup_is_named_after_the_store() {
+        let (dir, access) = fake_store(&store_json(COOKIES, fake_seal, ""), player_closed);
+        let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
+
+        let temps: Vec<_> = files_in(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert_eq!(temps.len(), 1, "{temps:?}");
+        assert!(
+            is_stray_temp_name("RobloxCookies.dat", &temps[0]),
+            "{temps:?}"
+        );
     }
 
     #[test]
@@ -1152,8 +1251,7 @@ mod tests {
     /// closed; what is written is what is on disk at the end.
     #[test]
     fn a_store_rewritten_after_the_check_is_the_one_switched() {
-        let before = store_json(COOKIES, fake_seal, "");
-        let (dir, access) = fake_store(&before, player_closed);
+        let (dir, access) = fake_store(&store_json(COOKIES, fake_seal, ""), player_closed);
         let path = access.path.clone();
         let store = OpenStore::open(access).unwrap();
         store.back_up().unwrap();
@@ -1168,9 +1266,10 @@ mod tests {
         let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
         assert_eq!(
             backup.unwrap(),
-            before,
-            "the backup is the store as checked"
+            rewritten,
+            "the backup is what was replaced"
         );
+        assert!(no_temp_files(dir.path()), "{:?}", files_in(dir.path()));
     }
 
     /// A Player killed while writing its store can leave it torn: the copy
@@ -1178,12 +1277,17 @@ mod tests {
     #[test]
     fn a_store_torn_after_the_check_is_written_from_the_checked_copy() {
         let before = store_json(COOKIES, fake_seal, r#","Kept":1"#);
-        let (_dir, access) = fake_store(&before, player_closed);
+        let (dir, access) = fake_store(&before, player_closed);
         let path = access.path.clone();
         let store = OpenStore::open(access).unwrap();
+        store.back_up().unwrap();
 
-        fs::write(&path, r#"{"CookiesVersion":"1","Cook"#).unwrap();
+        let torn = r#"{"CookiesVersion":"1","Cook"#;
+        fs::write(&path, torn).unwrap();
         store.write(&new_session()).unwrap();
+
+        let backup = fs::read_to_string(dir.path().join("RobloxCookies.dat.rbx-account.bak"));
+        assert_eq!(backup.unwrap(), torn, "the backup is what was replaced");
 
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1241,11 +1345,11 @@ mod tests {
     }
 
     #[test]
-    fn stray_temps_older_than_a_minute_are_removed_and_nothing_else() {
+    fn old_stray_temps_are_removed_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("RobloxCookies.dat");
         let now = SystemTime::now();
-        let old = now - Duration::from_secs(120);
+        let old = now - Duration::from_secs(600);
         let touch = |name: &str, modified: SystemTime| {
             let file = fs::File::create(dir.path().join(name)).unwrap();
             file.set_modified(modified).unwrap();
