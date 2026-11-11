@@ -56,6 +56,10 @@ pub trait OpenPlayers {
 /// The Player's cookie store, read and checked by
 /// [`CredentialStore::open_player_store`].
 pub trait PlayerStore {
+    /// Keep the store as it was read beside it, before anything irreversible
+    /// happens: a backup that cannot be written stops the switch there.
+    fn back_up(&self) -> Result<()>;
+
     /// Put `session` in the closed Player's store, so it opens signed in with
     /// it next time.
     fn write_session(self: Box<Self>, session: &Session) -> Result<()>;
