@@ -4,7 +4,7 @@
 
 ### Added
 
-- **`--player` keeps a backup of the Player's cookie store**, as `RobloxCookies.dat.rbx-account.bak` beside it: the store as it was before the latest switch. It is written before the sign-in ticket is requested or a Player closed, and a backup that cannot be written stops the switch with nothing changed. With the Player closed, copying it back over `RobloxCookies.dat` undoes that switch.
+- **`--player` keeps a backup of the Player's cookie store**, as `RobloxCookies.dat.rbx-account.bak` beside it: the store as it was before the latest switch. It is prepared before the sign-in ticket is requested or a Player closed, and a backup that cannot be prepared stops the switch with nothing changed. It replaces the previous backup only when the store is written, so a switch that stops keeps the previous one, and it holds the store exactly as it was replaced. With the Player closed, copying it back over `RobloxCookies.dat` undoes that switch.
 
 ### Changed
 
@@ -14,7 +14,7 @@
 ### Fixed
 
 - **`--player` checks the Player's cookie store before anything changes.** A store that is missing, cannot be decrypted, is not in the expected format or is signed out is refused before a sign-in ticket is requested and before `--force` closes the Player. If the store changes after that check and can no longer be read, for instance left torn by a Player closed while writing it, the session goes into the store as it was checked, and the switch says so.
-- **`--player` keeps every key of the Player's cookie store file**, the ones it does not use included, instead of dropping them. The new store and its backup are each written to a temp file of their own, created for that write alone and flushed to disk, then renamed into place, so two runs at once cannot leave a half-written store. A temp file left by a run that died holds a whole encrypted session, so each switch removes the ones older than a minute, and nothing else.
+- **`--player` keeps every key of the Player's cookie store file**, the ones it does not use included, instead of dropping them. The new store and its backup are each written to a temp file of their own, created for that write alone and flushed to disk, then renamed into place, so two runs at once cannot leave a half-written store. A temp file left by a run that died holds a whole encrypted session, so each switch removes the ones older than five minutes, longer than any switch takes, and nothing else.
 - **`--force` no longer reports a Player it could not close as closed.** When Windows refuses to open the Player's process, for instance a Player running as administrator, the switch stops there with the reason, before anything is written. "Closed the Roblox Player" is printed only when a Player was actually closed.
 - **`--force` closes every open Player or none.** Every running Player is opened and identified before the sign-in ticket is requested, so one that cannot be closed refuses the switch with nothing closed and no session issued. A Player that is already exiting counts as closed.
 - **`--force` closes only the Roblox Player.** Before terminating a process, it checks that the process still runs `RobloxPlayerBeta.exe`: one that took the id of a Player that exited is left running, and named.
